@@ -1,4 +1,4 @@
-<!DOCTYPE html><html><head><meta charset="utf-8"><style>:root{color-scheme:light}body{margin:0;font:14px system-ui;background:#fafaf8}img{max-width:100%}[hidden]{display:none!important}</style></head><body><script>
+<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>面の振り分け</title><style>:root{color-scheme:light}body{margin:0;font:14px system-ui;background:#fafaf8}img{max-width:100%}[hidden]{display:none!important}</style></head><body><script>
 /* 保存先は Apps Script のスプレッドシート。ほかの人の変更は数秒ごとに確認して反映する */
 (() => {
   const codeOf = (msg) => /bad key|bad collection|too large|not_found|no such function/.test(msg) ? 'invalid_argument' : 'unavailable';
@@ -15,13 +15,24 @@
     const LSK = 'men.apiKey';
     const store = { get(){ try { return localStorage.getItem(LSK); } catch(_){ return null; } }, set(v){ try { localStorage.setItem(LSK, v); } catch(_){} } };
     const hp = new URLSearchParams(location.hash.slice(1));
+    const qp = new URLSearchParams(location.search);
     let api = null;
-    const k = hp.get('k');
+    const k = hp.get('k') || qp.get('k');   /* 「#k=」でも「?k=」でも受け付ける（アプリによって # 以降が落ちるため） */
     if (k && /^[A-Za-z0-9_-]{20,200}$/.test(k)){ store.set(k); }
+    /* 鍵の手入力（リンクの # 以降が落ちたとき用）：画面の案内欄から呼ぶ */
+    window.__setKey = (text) => {
+      const t = String(text || '').trim();
+      const m = /[?#&]k=([A-Za-z0-9_-]{20,200})/.exec(t) || /^([A-Za-z0-9_-]{20,200})$/.exec(t) || /\/macros\/s\/([A-Za-z0-9_-]{20,200})\/exec/.exec(t);
+      if (!m) return false;
+      store.set(m[1]); location.replace(location.pathname); return true;
+    };
     const test = hp.get('api');   /* 手元の試験用：127.0.0.1 の模擬サーバだけ受け付ける */
     if (test && /^http:\/\/127\.0\.0\.1:\d+\/exec$/.test(test)) api = test;
     else { const key = store.get(); if (key && /^[A-Za-z0-9_-]{20,200}$/.test(key)) api = 'https://script.google.com/macros/s/' + key + '/exec'; }
-    if (k && history.replaceState) history.replaceState(null, '', location.pathname + location.search);   /* 鍵をアドレス欄に残さない */
+    if (k && history.replaceState){   /* 鍵をアドレス欄に残さない */
+      qp.delete('k'); const q = qp.toString();
+      history.replaceState(null, '', location.pathname + (q ? '?' + q : ''));
+    }
     if (!api){ window.__needKey = true; return; }
     call = async (fn, ...args) => {
       let r;
@@ -1622,7 +1633,14 @@ function renderEmpty(){
   if (S.books === null || S.bookId){ el.hidden = true; return; }
   el.hidden = false;
   if (window.__needKey){
-    el.innerHTML = '<div class="card"><h3>共有されたリンクから開いてください</h3><p>このページは，幹部から送られたリンク（末尾に「#k=」が付いたもの）をそのまま開くと使えます。一度開けば，この端末では次から自動でつながります。</p></div>'; return;
+    el.innerHTML = `<div class="card"><h3>共有されたリンクから開いてください</h3>
+      <p>送られたリンク（末尾に「k=」が付いたもの）をそのまま開くと使えます。一度つながれば，この端末では次から自動でつながります。</p>
+      <p class="note">リンクを開いてもこの画面になるときは，送られたリンクを丸ごと下に貼り付けてください。</p>
+      <div class="row"><input id="keyIn" placeholder="送られたリンクを貼り付け" aria-label="送られたリンク" autocomplete="off"><button class="btn primary" id="keyBtn">つなぐ</button></div></div>`;
+    const go = () => { if (!window.__setKey || !window.__setKey($('keyIn').value)) toast('リンクから保存先を読み取れませんでした。送られたリンクを丸ごと貼り付けてください', 'warn'); };
+    $('keyBtn').onclick = go;
+    $('keyIn').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+    return;
   }
   const login = 'Claude にログインした状態で，共有されたリンクから開き直してください。';
   if (S.store === 'cloud' && S.noData){
