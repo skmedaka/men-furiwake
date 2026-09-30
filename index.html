@@ -1,0 +1,1873 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><style>:root{color-scheme:light}body{margin:0;font:14px system-ui;background:#fafaf8}img{max-width:100%}[hidden]{display:none!important}</style></head><body><script>
+/* 保存先は Apps Script のスプレッドシート。ほかの人の変更は数秒ごとに確認して反映する */
+(() => {
+  const codeOf = (msg) => /bad key|bad collection|too large|not_found|no such function/.test(msg) ? 'invalid_argument' : 'unavailable';
+  let call = null;
+  if (window.google && google.script && google.script.run){
+    /* Apps Script の URL で開いたとき */
+    call = (fn, ...args) => new Promise((res, rej) => {
+      google.script.run
+        .withSuccessHandler(res)
+        .withFailureHandler((e) => { const msg = String((e && e.message) || e || ''); rej({code:codeOf(msg), message:msg}); })[fn](...args);
+    });
+  } else {
+    /* GitHub Pages などで開いたとき：保存先の鍵（Apps Script のデプロイ ID）はリンクの # 以降で受け取り，この端末に覚えておく */
+    const LSK = 'men.apiKey';
+    const store = { get(){ try { return localStorage.getItem(LSK); } catch(_){ return null; } }, set(v){ try { localStorage.setItem(LSK, v); } catch(_){} } };
+    const hp = new URLSearchParams(location.hash.slice(1));
+    let api = null;
+    const k = hp.get('k');
+    if (k && /^[A-Za-z0-9_-]{20,200}$/.test(k)){ store.set(k); }
+    const test = hp.get('api');   /* 手元の試験用：127.0.0.1 の模擬サーバだけ受け付ける */
+    if (test && /^http:\/\/127\.0\.0\.1:\d+\/exec$/.test(test)) api = test;
+    else { const key = store.get(); if (key && /^[A-Za-z0-9_-]{20,200}$/.test(key)) api = 'https://script.google.com/macros/s/' + key + '/exec'; }
+    if (k && history.replaceState) history.replaceState(null, '', location.pathname + location.search);   /* 鍵をアドレス欄に残さない */
+    if (!api){ window.__needKey = true; return; }
+    call = async (fn, ...args) => {
+      let r;
+      try { r = await fetch(api, {method:'POST', body:JSON.stringify({fn, args}), credentials:'omit', cache:'no-store', redirect:'follow'}); }
+      catch(e){ throw {code:'unavailable', message:String(e && e.message || e)}; }
+      let j = null; try { j = await r.json(); } catch(_){}
+      if (!j) throw {code:'unavailable', message:'bad response ' + r.status};
+      if (!j.ok){ const msg = String(j.error || ''); throw {code:codeOf(msg), message:msg}; }
+      return j.result;
+    };
+  }
+  const META = {fromCache:false, hasPendingWrites:false};
+  const parse = (j) => { try { return j == null ? null : JSON.parse(j); } catch(_){ return null; } };
+  const docSnap = (path, r) => { const d = r && r.exists ? parse(r.json) : null; return {id:path.split('/').pop(), exists:!!d, data:() => d, metadata:META}; };
+  const docSubs = new Map();   /* path -> {cbs:Set, v} */
+  const collSubs = new Map();  /* name -> {cbs:Set, sig} */
+  async function fetchDoc(path){
+    const sub = docSubs.get(path); if (!sub) return;
+    try { const r = await call('api_get', path); sub.v = r.v; const s = docSnap(path, r); for (const cb of sub.cbs) cb.next(s); }
+    catch(e){ for (const cb of sub.cbs) if (cb.err) cb.err(e); }
+  }
+  async function fetchColl(name){
+    const sub = collSubs.get(name); if (!sub) return;
+    try {
+      const list = await call('api_list', name);
+      const docs = list.map(x => { const d = parse(x.json); return {id:x.id, exists:!!d, data:() => d, metadata:META}; }).filter(x => x.exists);
+      for (const cb of sub.cbs) cb.next({docs, metadata:META});
+    } catch(e){ for (const cb of sub.cbs) if (cb.err) cb.err(e); }
+  }
+  const sigOf = (vers, name) => Object.keys(vers).filter(k => k.startsWith(name + '/')).sort().map(k => k + ':' + vers[k]).join(',');
+  let polling = false;
+  async function poll(){
+    if (polling) return; polling = true;
+    try {
+      const vers = await call('api_versions');
+      for (const [path, sub] of docSubs) if ((vers[path] || 0) !== sub.v) fetchDoc(path);
+      for (const [name, sub] of collSubs){ const sig = sigOf(vers, name); if (sig !== sub.sig){ sub.sig = sig; fetchColl(name); } }
+    } catch(_){ /* offline for a moment: try again on the next round */ }
+    finally { polling = false; }
+  }
+  let timer = null, kick = null;
+  const loop = () => { clearTimeout(timer); timer = setTimeout(async () => { if (!document.hidden) await poll(); loop(); }, 5000); };
+  const soon = () => { clearTimeout(kick); kick = setTimeout(poll, 150); };
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+  const afterWrite = (path, v) => { const sub = docSubs.get(path); if (sub && typeof v === 'number') sub.v = v; soon(); };
+  window.__gasdb = {
+    doc(path){
+      return {
+        onSnapshot(next, err){
+          let sub = docSubs.get(path); if (!sub){ sub = {cbs:new Set(), v:-1}; docSubs.set(path, sub); }
+          const cb = {next, err}; sub.cbs.add(cb); fetchDoc(path);
+          return () => { sub.cbs.delete(cb); if (!sub.cbs.size) docSubs.delete(path); };
+        },
+        async get(){ return docSnap(path, await call('api_get', path)); },
+        async set(d){ afterWrite(path, await call('api_set', path, JSON.stringify(d))); },
+        async update(p){ afterWrite(path, await call('api_update', path, JSON.stringify(p))); },
+        async delete(){ await call('api_delete', path); afterWrite(path, 0); },
+      };
+    },
+    collection(name){
+      const q = {
+        orderBy(){ return q; }, limit(){ return q; }, where(){ return q; },
+        onSnapshot(next, err){
+          let sub = collSubs.get(name); if (!sub){ sub = {cbs:new Set(), sig:null}; collSubs.set(name, sub); }
+          const cb = {next, err}; sub.cbs.add(cb); fetchColl(name);
+          return () => { sub.cbs.delete(cb); if (!sub.cbs.size) collSubs.delete(name); };
+        },
+      };
+      return q;
+    },
+  };
+  loop();
+})();
+</script>
+<title>面の振り分け</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=BIZ+UDPGothic:wght@400;700&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap">
+<style>
+/* Layout: one-screen tool. Top bar (book / page / mode / export), court sheet on the left, roster panel on the right; below 900px the roster becomes a bottom sheet. */
+:root{
+  --bg:#E8EBE4; --surface:#F6F7F3; --paper:#FFFFFF; --ink:#1C2230; --ink-2:#555D6C;
+  --line:#262B35; --rule:#CFD4CA; --gap-tint:#EDF0E8; --dash:#C6CBC0;
+  --accent:#0B6E7F; --accent-ink:#FFFFFF; --accent-soft:#D5ECEF;
+  --warn:#B94A0B; --warn-soft:#FBE6D6; --danger:#B42318; --danger-soft:#FBE3E0;
+  --shadow:0 6px 24px rgba(28,34,48,.16);
+  --f-ui:"Zen Kaku Gothic New","Hiragino Sans","Yu Gothic UI","Noto Sans JP",system-ui,sans-serif;
+  --f-name:"BIZ UDPGothic","Hiragino Sans","Yu Gothic UI","Noto Sans JP",sans-serif;
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --bg:#12161C; --surface:#1A1F27; --paper:#1E242D; --ink:#E6E9EE; --ink-2:#A3AAB6;
+  --line:#C5CCD6; --rule:#2F3642; --gap-tint:#252C36; --dash:#465061;
+  --accent:#3DB5C6; --accent-ink:#0A1A1D; --accent-soft:#17363C;
+  --warn:#F2A065; --warn-soft:#3A2819; --danger:#F7776C; --danger-soft:#3B1D1B;
+  --shadow:0 6px 24px rgba(0,0,0,.45); color-scheme:dark }}
+:root[data-theme="dark"]{
+  --bg:#12161C; --surface:#1A1F27; --paper:#1E242D; --ink:#E6E9EE; --ink-2:#A3AAB6;
+  --line:#C5CCD6; --rule:#2F3642; --gap-tint:#252C36; --dash:#465061;
+  --accent:#3DB5C6; --accent-ink:#0A1A1D; --accent-soft:#17363C;
+  --warn:#F2A065; --warn-soft:#3A2819; --danger:#F7776C; --danger-soft:#3B1D1B;
+  --shadow:0 6px 24px rgba(0,0,0,.45); color-scheme:dark }
+html,body{height:100%}
+body{background:var(--bg);color:var(--ink);font-family:var(--f-ui);font-size:14px;overflow:hidden}
+button,input,select{font:inherit;color:inherit}
+button{cursor:pointer}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.app{height:100%;display:flex;flex-direction:column;padding-inline:16px;padding-block:10px;gap:10px;box-sizing:border-box}
+/* top bar */
+.topbar{display:flex;align-items:center;gap:10px 14px;flex-wrap:wrap}
+.brand{font-weight:700;font-size:17px;letter-spacing:.02em;white-space:nowrap}
+.brand b{color:var(--accent)}
+.btn{border:1px solid var(--rule);background:var(--surface);border-radius:8px;padding:6px 10px;display:inline-flex;align-items:center;gap:6px;min-height:34px;white-space:nowrap}
+.btn:hover{border-color:var(--ink-2)}
+.btn[aria-pressed="true"],.btn.on{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+.btn:disabled{opacity:.4;cursor:default}
+.btn.icon{padding:6px 8px;min-width:34px;justify-content:center}
+.btn.ghost{background:transparent;border-color:transparent}
+.btn.danger{color:var(--danger);border-color:var(--danger)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.book-btn{max-width:260px;overflow:hidden;text-overflow:ellipsis;font-weight:500}
+.pager{display:flex;align-items:center;gap:6px;flex:1 1 320px;min-width:0;justify-content:center}
+.titlebox{display:flex;align-items:center;gap:4px;border:1.5px solid var(--line);border-radius:6px;background:var(--paper);padding:2px 4px;min-width:0;flex:0 1 420px}
+.titlebox input{border:0;background:transparent;text-align:center;font-weight:700;font-size:16px;min-width:0;flex:1;padding:4px 2px}
+.titlebox input:focus{outline:none}
+.titlebox .arr{border:0;background:transparent;font-size:18px;padding:2px 6px;border-radius:4px;line-height:1}
+.titlebox .arr:disabled{opacity:.25}
+.pageno{font-variant-numeric:tabular-nums;color:var(--ink-2);font-size:12px;white-space:nowrap}
+.tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.seg{display:inline-flex;border:1px solid var(--rule);border-radius:8px;overflow:hidden}
+.seg button{border:0;background:var(--surface);padding:6px 12px;min-height:34px}
+.seg button[aria-pressed="true"]{background:var(--ink);color:var(--paper)}
+.menu-wrap{position:relative}
+.menu{position:absolute;right:0;top:calc(100% + 4px);background:var(--surface);border:1px solid var(--rule);border-radius:10px;box-shadow:var(--shadow);padding:6px;z-index:30;min-width:190px;display:flex;flex-direction:column;gap:2px}
+.menu button{border:0;background:transparent;text-align:left;padding:8px 10px;border-radius:6px}
+.menu button:hover{background:var(--accent-soft)}
+.menu .sep{height:1px;background:var(--rule);margin:4px 2px}
+.menu button.danger{color:var(--danger)}
+/* work area */
+.work{flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:12px}
+.work.roster-closed{grid-template-columns:minmax(0,1fr) 0}
+.stage{position:relative;min-width:0;min-height:0;display:flex;flex-direction:column;gap:8px}
+.court-scroll{flex:1;min-height:0;overflow:auto;background:var(--surface);border:1px solid var(--rule);border-radius:12px;display:flex;align-items:flex-start;justify-content:center;padding:8px;box-sizing:border-box}
+#court{display:block;overflow:visible;touch-action:manipulation;user-select:none;-webkit-user-select:none;flex:none}
+.bottombar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.bottombar .hint{color:var(--ink-2);font-size:12.5px;flex:1;min-width:0}
+.bottombar .hint.act{color:var(--accent);font-weight:500}
+.status{font-size:11.5px;color:var(--ink-2);white-space:nowrap}
+.status.local{color:var(--warn)}
+/* court svg */
+.c-frame{fill:var(--paper);stroke:var(--line);stroke-width:2}
+.c-gap{fill:var(--gap-tint)}
+.c-line{stroke:var(--line);stroke-width:2}
+.c-net{stroke:var(--line);stroke-width:2.2}
+.c-out{fill:none;stroke:none}
+.cell{fill:transparent;stroke:var(--dash);stroke-width:1;stroke-dasharray:4 3}
+.cell.ctr{stroke:var(--accent);stroke-dasharray:3 3}
+.cell.tgt{fill:var(--accent-soft);stroke:var(--accent);stroke-width:2;stroke-dasharray:none}
+.cell.tgt.bad{fill:var(--danger-soft);stroke:var(--danger)}
+.item{cursor:grab;touch-action:none}
+.item .box{fill:var(--paper);stroke-width:2.6}
+.item .nm{font-family:var(--f-name);font-weight:700;font-size:17px;fill:var(--ink);pointer-events:none}
+.item.gone .nm{fill:var(--ink-2)}
+.item .star{font-size:13px;fill:var(--ink);pointer-events:none}
+.item .dup{fill:var(--warn)}
+.item .dupt{fill:#fff;font-size:10px;font-weight:700;pointer-events:none}
+.item.sel .ring,.item.src .ring{fill:none;stroke:var(--accent);stroke-width:2;stroke-dasharray:none}
+.item.src .box{fill:var(--accent-soft)}
+.item.lift{opacity:.85}
+.anchor{fill:var(--paper);stroke:var(--accent);stroke-width:2}
+.anchor.on{fill:var(--accent);stroke-width:3}
+.anchor.faint{opacity:.6}
+.snap{fill:none;stroke:var(--accent);stroke-width:3}
+.arrow.preview .ln{stroke:var(--accent);stroke-dasharray:6 4}
+.arrow.preview .head{fill:var(--accent)}
+.pop .siderow{display:flex;align-items:center;gap:4px;width:100%}
+.pop .siderow .sl{font-size:12px;color:var(--ink-2);min-width:88px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pop .sbtn{min-width:36px;justify-content:center;padding:4px 6px}
+.pop .sbtn[aria-pressed="true"]{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+.arrow .ln{fill:none;stroke:var(--ink);stroke-width:2}
+.arrow .head{fill:var(--ink)}
+.arrow .hit{fill:none;stroke:transparent;stroke-width:16;cursor:pointer}
+.arrow.sel .ln{stroke:var(--accent);stroke-width:2.6}
+.arrow.sel .head{fill:var(--accent)}
+.handle{fill:var(--accent);stroke:var(--paper);stroke-width:2;cursor:move;touch-action:none}
+.tmp{fill:none;stroke:var(--accent);stroke-width:2;stroke-dasharray:5 4}
+/* read-only viewers: only page switching, zoom and export */
+body.ro #pageMenuBtn,body.ro .tools .seg,body.ro #rosterToggle,body.ro #undoBtn,body.ro #redoBtn,body.ro #arrowBtn,body.ro #roster,body.ro .ro-hide{display:none!important}
+body.ro .work{grid-template-columns:minmax(0,1fr) 0}
+body.ro #pageTitle{cursor:default}
+body.ro .item{cursor:default}
+body.ro .arrow .hit{cursor:default}
+.dlg a.btn{text-decoration:none;display:inline-flex;align-items:center;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+[hidden]{display:none!important}
+/* popover */
+.pop{position:absolute;z-index:25;max-width:min(360px,calc(100% - 8px));box-sizing:border-box;background:var(--surface);border:1px solid var(--rule);border-radius:10px;box-shadow:var(--shadow);padding:5px;display:flex;gap:4px;flex-wrap:wrap}
+.pop .btn{min-height:32px;padding:4px 10px}
+.pop .who{font-size:12px;color:var(--ink-2);padding:6px 6px 0;width:100%}
+/* roster panel */
+.roster{min-width:0;min-height:0;display:flex;flex-direction:column;background:var(--surface);border:1px solid var(--rule);border-radius:12px;overflow:hidden}
+.work.roster-closed .roster{display:none}
+.r-head{display:flex;align-items:center;gap:6px;padding:10px 10px 8px;border-bottom:1px solid var(--rule)}
+.r-head h2{font-size:15px;margin:0;flex:1}
+.r-search{margin:8px 10px 4px;border:1px solid var(--rule);border-radius:8px;padding:6px 10px;background:var(--paper)}
+.r-sel{margin:4px 10px;padding:6px 10px;border-radius:8px;background:var(--accent-soft);color:var(--ink);font-size:12.5px;display:flex;gap:8px;align-items:center}
+.r-sel button{margin-left:auto}
+.r-list{flex:1;overflow:auto;padding:4px 6px 10px;overscroll-behavior:contain}
+.grp{margin-top:4px}
+.grp-h{display:flex;align-items:center;gap:6px;padding:4px 4px}
+.grp-h .tog{border:0;background:transparent;display:flex;align-items:center;gap:6px;padding:4px 2px;font-weight:700;font-size:14px;flex:1;text-align:left}
+.grp-h .chev{display:inline-block;width:12px;transition:transform .15s;color:var(--ink-2)}
+.grp.open .chev{transform:rotate(90deg)}
+.grp-h .cnt{font-weight:400;color:var(--ink-2);font-size:12px}
+.grp-h .sw{width:10px;height:10px;border-radius:3px;display:inline-block}
+.grp-b{display:none;flex-direction:column;gap:3px;padding:2px 2px 6px 22px}
+.grp.open .grp-b{display:flex}
+.mem{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:7px;border:2px solid transparent;background:var(--paper);cursor:grab;touch-action:pan-y;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+.mem .full{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mem .disp{font-family:var(--f-name);font-weight:700;font-size:12.5px;padding:1px 6px;border-radius:5px;border:2px solid;white-space:nowrap}
+.mem .onp{font-size:11px;color:var(--ink-2);font-variant-numeric:tabular-nums}
+.mem .onp.dup{color:var(--warn);font-weight:700}
+.mem .noy{font-size:10.5px;color:var(--warn)}
+.mem.picked{border-color:var(--accent);background:var(--accent-soft)}
+.mem .del,.mem .edit{border:0;background:transparent;padding:2px 6px;border-radius:5px;color:var(--ink-2)}
+.mem .del{color:var(--danger)}
+.r-foot{border-top:1px solid var(--rule);padding:8px 10px;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.r-foot input{flex:1;min-width:80px;border:1px solid var(--rule);border-radius:8px;padding:6px 8px;background:var(--paper)}
+.ghost-drag{position:fixed;z-index:60;pointer-events:none;background:var(--paper);border:2.6px solid;border-radius:4px;padding:6px 14px;font-family:var(--f-name);font-weight:700;font-size:16px;box-shadow:var(--shadow);transform:translate(-50%,-50%)}
+/* empty state */
+.empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:5}
+.empty .card{background:var(--surface);border:1px solid var(--rule);border-radius:14px;padding:22px 24px;max-width:420px;box-shadow:var(--shadow);display:flex;flex-direction:column;gap:12px}
+.empty h3{margin:0;font-size:17px}
+.empty p{margin:0;color:var(--ink-2);line-height:1.7}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.row input{flex:1;min-width:0;border:1px solid var(--rule);border-radius:8px;padding:7px 10px;background:var(--paper)}
+/* dialogs */
+.scrim{position:fixed;inset:0;background:rgba(10,14,20,.38);z-index:50;display:flex;align-items:center;justify-content:center;padding:16px}
+.dlg{background:var(--surface);border-radius:14px;box-shadow:var(--shadow);width:min(460px,100%);max-height:calc(100% - 32px);overflow:auto;padding:18px;display:flex;flex-direction:column;gap:12px;box-sizing:border-box}
+.dlg h3{margin:0;font-size:16px}
+.dlg label{display:flex;flex-direction:column;gap:4px;font-size:12.5px;color:var(--ink-2)}
+.dlg input,.dlg select{border:1px solid var(--rule);border-radius:8px;padding:7px 10px;background:var(--paper);font-size:14px;color:var(--ink)}
+.dlg .note{font-size:12px;color:var(--ink-2);line-height:1.6;margin:0}
+.dlg .acts{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
+.books{display:flex;flex-direction:column;gap:6px}
+.bk{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--rule);border-radius:10px;background:var(--paper)}
+.bk.cur{border-color:var(--accent);box-shadow:inset 3px 0 0 var(--accent)}
+.bk .t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500;text-align:left;border:0;background:transparent;padding:4px 0}
+.bk .d{font-size:11.5px;color:var(--ink-2);font-variant-numeric:tabular-nums}
+.colors{display:flex;flex-direction:column;gap:8px}
+.crow{display:flex;align-items:center;gap:10px}
+.crow .yy{width:48px;font-weight:700;font-variant-numeric:tabular-nums}
+.swatch{width:30px;height:30px;border-radius:50%;border:3px solid var(--surface);outline:2px solid transparent;cursor:pointer;padding:0}
+.swatch[aria-checked="true"]{outline-color:var(--ink)}
+.toast{position:fixed;left:50%;bottom:calc(18px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:var(--ink);color:var(--paper);padding:9px 14px;border-radius:10px;z-index:70;display:flex;gap:12px;align-items:center;box-shadow:var(--shadow);max-width:calc(100% - 32px);font-size:13px}
+.toast.warn{background:var(--warn);color:#fff}
+.toast button{border:0;background:transparent;color:inherit;text-decoration:underline;font-weight:700}
+@media (max-width: 899px){
+  .app{padding-block:8px;gap:8px}
+  .work,.work.roster-closed{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr) auto}
+  .roster{max-height:44vh}
+  .work.roster-closed .roster{display:flex;max-height:44px}
+  .work.roster-closed .roster > :not(.r-head){display:none}
+  .work.roster-closed .r-head{border-bottom:0}
+  .pager{order:3;flex-basis:100%}
+  .brand{font-size:15px}
+}
+@media (max-width: 599px){
+  .brand{display:none}
+  .topbar{gap:6px}
+  .book-btn{flex:1 1 0;max-width:none;min-width:0;font-size:13px}
+  #rosterToggle{display:none}
+  .seg button{padding:6px 9px}
+  .btn{padding:6px 8px;font-size:13px}
+  .titlebox input{font-size:15px}
+  .bottombar{gap:6px}
+  .bottombar .hint{display:none}
+  .bottombar .hint.act{display:block;order:20;flex-basis:100%;font-size:12px}
+  .bottombar .status{order:21;flex-basis:100%;font-size:11px}
+  .roster{max-height:42vh}
+  .r-head{cursor:pointer}
+}
+@media (prefers-reduced-motion: reduce){ *{transition:none!important} }
+</style>
+<div class="app" id="app">
+  <header class="topbar">
+    <div class="brand">【面の振り分け】</div>
+    <button class="btn book-btn" id="bookBtn" aria-haspopup="dialog">ブック：<span id="bookName">読み込み中</span> ▾</button>
+    <div class="pager">
+      <div class="titlebox">
+        <button class="arr" id="prevPage" aria-label="前の時間の振り分け">◀</button>
+        <input id="pageTitle" placeholder="タイトル" aria-label="この時間帯のタイトル" autocomplete="off">
+        <button class="arr" id="nextPage" aria-label="次の時間の振り分け">▶</button>
+      </div>
+      <span class="pageno" id="pageNo">–</span>
+      <div class="menu-wrap">
+        <button class="btn icon" id="pageMenuBtn" aria-label="ページの操作" aria-haspopup="menu">⋯</button>
+        <div class="menu" id="pageMenu" role="menu" hidden>
+          <button id="pmAdd" role="menuitem">次にページを追加（空白）</button>
+          <button id="pmDup" role="menuitem">このページを複製</button>
+          <div class="sep"></div>
+          <button id="pmDel" role="menuitem" class="danger">このページを削除</button>
+        </div>
+      </div>
+    </div>
+    <div class="tools">
+      <div class="seg" role="group" aria-label="面の数">
+        <button id="mode3" aria-pressed="true">3面</button><button id="mode4" aria-pressed="false">4面</button>
+      </div>
+      <div class="menu-wrap">
+        <button class="btn" id="exportBtn" aria-haspopup="menu">書き出し ▾</button>
+        <div class="menu" id="exportMenu" role="menu" hidden>
+          <button id="exJpg" role="menuitem">JPEG（このページ）</button>
+          <button id="exPdf1" role="menuitem">PDF（このページ）</button>
+          <button id="exPdfAll" role="menuitem">PDF（ブック全体）</button>
+        </div>
+      </div>
+      <button class="btn" id="rosterToggle" aria-pressed="true">名前を流し込む</button>
+    </div>
+  </header>
+  <main class="work" id="work">
+    <section class="stage" id="stage">
+      <div class="court-scroll" id="courtScroll">
+        <svg id="court" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="面の振り分け図"></svg>
+      </div>
+      <div class="bottombar">
+        <button class="btn icon" id="undoBtn" aria-label="元に戻す" title="元に戻す">↶</button>
+        <button class="btn icon" id="redoBtn" aria-label="やり直し" title="やり直し">↷</button>
+        <button class="btn" id="arrowBtn" aria-pressed="false">矢印でつなぐ</button>
+        <span class="hint" id="hint"></span>
+        <button class="btn icon" id="zoomOut" aria-label="縮小">－</button>
+        <button class="btn icon" id="zoomIn" aria-label="拡大">＋</button>
+        <span class="status" id="status">接続中…</span>
+      </div>
+      <div class="pop" id="pop" hidden></div>
+      <div class="empty" id="empty" hidden></div>
+    </section>
+    <aside class="roster" id="roster" aria-label="名簿">
+      <div class="r-head">
+        <h2>名前を流し込む</h2>
+        <button class="btn icon ghost" id="rosterFold" aria-label="名簿を閉じる">✕</button>
+      </div>
+      <input class="r-search" id="rSearch" placeholder="名前で絞り込み" aria-label="名前で絞り込み" autocomplete="off">
+      <div class="r-sel" id="rSel" hidden></div>
+      <div class="r-list" id="rList"></div>
+      <div class="r-foot">
+        <button class="btn" id="rEdit" aria-pressed="false">名簿を編集</button>
+        <button class="btn" id="rColors">学年の色</button>
+      </div>
+    </aside>
+  </main>
+</div>
+<div id="dlgRoot"></div>
+<script>
+(() => {
+'use strict';
+/* ---------- constants ---------- */
+const PALETTE = [
+  {key:'yellow', name:'黄', c:'#D6A300'},
+  {key:'green',  name:'緑', c:'#2F9E57'},
+  {key:'red',    name:'赤', c:'#D83A3A'},
+  {key:'blue',   name:'青', c:'#2D6AD6'},
+  {key:'purple', name:'紫', c:'#8B4FD1'},
+  {key:'orange', name:'橙', c:'#EA7B1E'},
+];
+const PAL = Object.fromEntries(PALETTE.map(p => [p.key, p]));
+const DEFAULT_COLORS = {'22':'yellow','23':'green','24':'red','25':'blue','26':'purple'};
+const NONE_COLOR = '#8A909B';
+const SIDES = ['b','t','r','l'];
+const NORMAL = {t:[0,-1], b:[0,1], l:[-1,0], r:[1,0]};
+/* 異体字を同じ姓として扱うための対応表 */
+const KANJI_NORM = {'﨑':'崎','嵜':'崎','髙':'高','邊':'辺','邉':'辺','澤':'沢','濱':'浜','齊':'斉','齋':'斉','斎':'斉','嶋':'島','嶌':'島','櫻':'桜','冨':'富','廣':'広','瀨':'瀬','德':'徳','槇':'槙','條':'条','關':'関','國':'国','籔':'薮','藪':'薮','𠮷':'吉','塚':'塚','惠':'恵','眞':'真','實':'実','龍':'竜','淺':'浅','會':'会','壽':'寿','彌':'弥','萬':'万','廣':'広','黑':'黒','團':'団','德':'徳'};
+const normFam = s => [...(s||'')].map(ch => KANJI_NORM[ch] || ch).join('');
+const CLIENT = 'c' + Math.random().toString(36).slice(2, 10);
+const uid = (p) => p + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+const clone = (o) => JSON.parse(JSON.stringify(o));
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const LS = {
+  get(k, d){ try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch(e){ return d; } },
+  set(k, v){ try { localStorage.setItem(k, JSON.stringify(v)); } catch(e){} },
+  del(k){ try { localStorage.removeItem(k); } catch(e){} },
+};
+
+/* ---------- geometry (shared by screen and export) ---------- */
+const G = (() => {
+  const M = 16, colW = 110, cellW = 100, cellH = 34, rowH = 40, hp = 6, outGap = 10;
+  const X0 = M;
+  const FY0 = M + rowH + outGap;
+  const halfH = 2 * hp + 5 * rowH;
+  const NY = FY0 + halfH;
+  const FY1 = NY + halfH;
+  const W = 2 * M + 8 * colW;
+  const H = FY1 + outGap + rowH + M;
+  return {M, colW, cellW, cellH, rowH, hp, outGap, X0, FY0, NY, FY1, W, H, halfH};
+})();
+const CENTERS = {3:[1,7,13], 4:[1,5,9,13]};
+const ROWS = 12; /* 0 = 枠外（上）, 1–5 = 上側, 6–10 = 下側, 11 = 枠外（下） */
+function rowY(r){
+  if (r === 0) return G.M + G.rowH / 2;
+  if (r <= 5) return G.FY0 + G.hp + (r - 1) * G.rowH + G.rowH / 2;
+  if (r <= 10) return G.NY + G.hp + (r - 6) * G.rowH + G.rowH / 2;
+  return G.FY1 + G.outGap + G.rowH / 2;
+}
+function colX(x){ return G.X0 + (x + 1) * G.colW / 2; }
+function validX(mode, x){ return x % 2 === 0 ? (x >= 0 && x <= 14) : CENTERS[mode].includes(x); }
+function slotsOf(mode){
+  const out = [];
+  for (let r = 0; r < ROWS; r++){
+    for (let x = 0; x <= 14; x += 2) out.push({r, x});
+    for (const c of CENTERS[mode]) out.push({r, x:c});
+  }
+  return out;
+}
+function overlaps(a, b){ return a.r === b.r && Math.abs(a.x - b.x) < 2; }
+function vLines(mode){ return mode === 3 ? [2,3,5,6] : [2,4,6]; }
+function gapCols(mode){ return mode === 3 ? [2,5] : []; }
+function slotAt(mode, px, py){
+  let best = -1, bd = 1e9;
+  for (let r = 0; r < ROWS; r++){ const d = Math.abs(py - rowY(r)); if (d < bd){ bd = d; best = r; } }
+  if (bd > G.rowH * 0.8) return null;
+  const u = (px - G.X0) / G.colW;
+  if (u < -0.35 || u > 8.35) return null;
+  for (const c of CENTERS[mode]){ const b = (c + 1) / 2; if (Math.abs(u - b) < 0.27) return {r:best, x:c}; }
+  const col = Math.max(0, Math.min(7, Math.floor(u)));
+  return {r:best, x:col * 2};
+}
+function anchorPt(it, s){
+  const cx = colX(it.x), cy = rowY(it.r);
+  if (s === 't') return [cx, cy - G.cellH / 2];
+  if (s === 'b') return [cx, cy + G.cellH / 2];
+  if (s === 'l') return [cx - G.cellW / 2, cy];
+  return [cx + G.cellW / 2, cy];
+}
+const HEAD_L = 11, HEAD_W = 5.5;
+function headOf(tip, dir, L){
+  const W = HEAD_W;
+  const base = [tip[0] - dir[0] * L, tip[1] - dir[1] * L];
+  const perp = [-dir[1], dir[0]];
+  return {h1:[base[0] + perp[0] * W, base[1] + perp[1] * W], h2:[base[0] - perp[0] * W, base[1] - perp[1] * W]};
+}
+/* one candidate curve: cubic p1 → c1 → c2 → end, head at tip pointing into side s2 */
+function cand(p1, c1, c2, end, tip, dir, L, kind){ return {p1, c1, c2, end, tip, ...headOf(tip, dir, L), kind}; }
+/* signed distance from a point to a name box (negative = inside) */
+function boxDist(q, it){
+  const dx = Math.abs(q[0] - colX(it.x)) - G.cellW / 2, dy = Math.abs(q[1] - rowY(it.r)) - G.cellH / 2;
+  if (dx <= 0 && dy <= 0) return Math.max(dx, dy);
+  return Math.hypot(Math.max(dx, 0), Math.max(dy, 0));
+}
+function courtSegs(mode){
+  const x0 = G.X0, x1 = G.X0 + 8 * G.colW;
+  const s = [[x0, G.FY0, x1, G.FY0], [x0, G.NY, x1, G.NY], [x0, G.FY1, x1, G.FY1], [x0, G.FY0, x0, G.FY1], [x1, G.FY0, x1, G.FY1]];
+  for (const v of vLines(mode)) s.push([G.X0 + v * G.colW, G.FY0, G.X0 + v * G.colW, G.FY1]);
+  return s;
+}
+/* how badly a candidate hides behind / hugs other names and court lines */
+function routeCost(g, env){
+  let cost = 0, len = 0, prev = g.p1;
+  const N = 36;
+  for (let i = 1; i < N; i++){
+    const t = i / N, q = cubicAt(g.p1, g.c1, g.c2, g.end, t);
+    const tx = q[0] - prev[0], ty = q[1] - prev[1]; len += Math.hypot(tx, ty); prev = q;
+    for (const it of env.items){
+      const isA = it.pid === env.a, isB = it.pid === env.b;
+      const sd = boxDist(q, it);
+      if (sd < 0){ if ((isA && t < 0.06) || (isB && t > 0.94)) continue; cost += 10; }
+      else if (sd < 3.5){ if ((isA && t < 0.3) || (isB && t > 0.7)) continue; cost += 1.5; }
+    }
+    for (const [ax, ay, bx, by] of env.segs){
+      if (ay === by){ if (Math.abs(q[1] - ay) < 3 && q[0] > ax && q[0] < bx && Math.abs(ty) < Math.abs(tx) * 0.6) cost += 1; }
+      else if (Math.abs(q[0] - ax) < 3 && q[1] > ay && q[1] < by && Math.abs(tx) < Math.abs(ty) * 0.6) cost += 1;
+    }
+  }
+  /* the head must not sit inside another name */
+  for (const q of [g.h1, g.h2, [(g.h1[0] + g.h2[0]) / 2, (g.h1[1] + g.h2[1]) / 2]])
+    for (const it of env.items) if (it.pid !== env.b && boxDist(q, it) < -0.5) cost += 6;
+  return cost + len * 0.004;
+}
+/* arrow from side s1 of one name to side s2 of another.
+   Default shape = the original curve; when that curve would pass behind other names or hug lines,
+   a cleaner alternative is chosen (e.g. straight down the narrow gap between two columns). */
+function arrowGeom(p1, s1, p2, s2, env){
+  const n1 = NORMAL[s1], n2 = NORMAL[s2];
+  const dist = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]);
+  const d0 = Math.max(30, Math.min(190, dist * 0.45));
+  const dir = [-n2[0], -n2[1]];
+  const std = (d1, d2, kind) => {
+    const end = [p2[0] + n2[0] * (HEAD_L - 2), p2[1] + n2[1] * (HEAD_L - 2)];
+    return cand(p1, [p1[0] + n1[0] * d1, p1[1] + n1[1] * d1], [p2[0] + n2[0] * d2, p2[1] + n2[1] * d2], end, p2, dir, HEAD_L, kind);
+  };
+  const def = std(d0, d0, 'default');
+  if (!env) return def;
+  const cl = (v) => Math.max(HEAD_L + 1, Math.min(300, v));
+  const cands = [];
+  for (const k of [0.3, 0.6, 1.5, 2.2]) cands.push(std(cl(d0 * k), cl(d0 * k), 'k' + k));
+  for (const [k1, k2] of [[1, 0.35], [0.35, 1], [1.8, 0.6], [0.6, 1.8]]) cands.push(std(cl(d0 * k1), cl(d0 * k2), 'a'));
+  const f1 = (p2[0] - p1[0]) * n1[0] + (p2[1] - p1[1]) * n1[1];
+  const f2 = (p1[0] - p2[0]) * n2[0] + (p1[1] - p2[1]) * n2[1];
+  if (f1 > 0 || f2 > 0) cands.push(std(cl(f1 > 0 ? f1 * 0.5 : d0), cl(f2 > 0 ? f2 * 0.5 : d0), 'fwd'));
+  /* facing sides across a narrow gap (e.g. 右 → 左 of the next column): run along the gap */
+  const facing = n1[0] === -n2[0] && n1[1] === -n2[1];
+  if (facing && f1 > 0 && f1 <= 22){
+    const f = f1;
+    const lat = [(p1[0] - p2[0]) - n2[0] * f2, (p1[1] - p2[1]) - n2[1] * f2];
+    const latLen = Math.hypot(lat[0], lat[1]);
+    if (latLen > 4){
+      const u = [lat[0] / latLen, lat[1] / latLen];
+      const L = Math.min(HEAD_L, Math.max(7, f - 1));
+      for (const r of [0.5, 0.3, 0.7]){
+        const m = f * r;                                       /* distance of the run from the target side */
+        const C = [p2[0] + n2[0] * m, p2[1] + n2[1] * m];       /* where the run meets the target's level */
+        const e = Math.min(L - 2, m);
+        const E = [p2[0] + n2[0] * e, p2[1] + n2[1] * e];
+        const c1 = [p1[0] + n1[0] * (f - m) * 2, p1[1] + n1[1] * (f - m) * 2];
+        const c2 = [C[0] + u[0] * latLen * 0.45, C[1] + u[1] * latLen * 0.45];
+        cands.push(cand(p1, c1, c2, E, p2, dir, L, 'gap' + r));
+      }
+    }
+  }
+  const dc = routeCost(def, env);
+  let best = def, bc = dc - 3;               /* keep the original shape unless an alternative is clearly better */
+  for (const c of cands){ const v = routeCost(c, env) + 0.5; if (v < bc){ bc = v; best = c; } }
+  return best;
+}
+/* geometry of a stored arrow on page p (null if an end is missing) */
+function routeEnv(p){ return {items:p.items, segs:courtSegs(p.mode)}; }
+function geomOf(p, a, env){
+  const A = p.items.find(i => i.pid === a.a.pid), B = p.items.find(i => i.pid === a.b.pid);
+  if (!A || !B) return null;
+  const e = env || routeEnv(p);
+  return arrowGeom(anchorPt(A, a.a.s), a.a.s, anchorPt(B, a.b.s), a.b.s, {...e, a:A.pid, b:B.pid});
+}
+function inBox(pt, it){ return Math.abs(pt[0] - colX(it.x)) < G.cellW / 2 + 2 && Math.abs(pt[1] - rowY(it.r)) < G.cellH / 2 + 2; }
+function cubicAt(a, b, c, d, t){
+  const u = 1 - t;
+  return [u*u*u*a[0] + 3*u*u*t*b[0] + 3*u*t*t*c[0] + t*t*t*d[0], u*u*u*a[1] + 3*u*u*t*b[1] + 3*u*t*t*c[1] + t*t*t*d[1]];
+}
+/* drawing area = court + every arrow (loops outside the frame are no longer cut off) */
+function pageBounds(p){
+  let x0 = 0, y0 = 0, x1 = G.W, y1 = G.H;
+  if (p){
+    const PAD = 10, env = routeEnv(p);
+    for (const a of p.arrows){
+      const g = geomOf(p, a, env); if (!g) continue;
+      const pts = [g.tip, g.h1, g.h2];
+      for (let i = 0; i <= 32; i++) pts.push(cubicAt(g.p1, g.c1, g.c2, g.end, i / 32));
+      for (const q of pts){
+        x0 = Math.min(x0, q[0] - PAD); y0 = Math.min(y0, q[1] - PAD);
+        x1 = Math.max(x1, q[0] + PAD); y1 = Math.max(y1, q[1] + PAD);
+      }
+    }
+  }
+  x0 = Math.floor(x0); y0 = Math.floor(y0); x1 = Math.ceil(x1); y1 = Math.ceil(y1);
+  return {x:x0, y:y0, w:x1 - x0, h:y1 - y0};
+}
+function autoSides(a, b, fixA, fixB){
+  const ca = [colX(a.x), rowY(a.r)], cb = [colX(b.x), rowY(b.r)];
+  let best = null, bc = 1e9;
+  for (const sa of (fixA ? [fixA] : SIDES)) for (const sb of (fixB ? [fixB] : SIDES)){
+    const pa = anchorPt(a, sa), pb = anchorPt(b, sb);
+    const dist = Math.hypot(pb[0] - pa[0], pb[1] - pa[1]);
+    let cost = dist;
+    if (dist < 36) cost += 400;
+    const na = NORMAL[sa], nb = NORMAL[sb];
+    const qa = [pa[0] + na[0] * 30, pa[1] + na[1] * 30], qb = [pb[0] + nb[0] * 30, pb[1] + nb[1] * 30];
+    const boxes = page() ? page().items : [a, b];
+    if (boxes.some(it => inBox(qa, it) || inBox(qb, it))) cost += 300;
+    if (na[0] * (cb[0] - ca[0]) + na[1] * (cb[1] - ca[1]) < -1) cost += 120;
+    if (nb[0] * (ca[0] - cb[0]) + nb[1] * (ca[1] - cb[1]) < -1) cost += 120;
+    if (cost < bc){ bc = cost; best = [sa, sb]; }
+  }
+  return best;
+}
+/* the side midpoint closest to (px,py): used for tapping and dropping arrow ends */
+function nearestAnchor(px, py, radius, exceptPid){
+  const p = page(); if (!p) return null;
+  let best = null, bd = 1e9;
+  for (const it of p.items){
+    if (it.pid === exceptPid) continue;
+    for (const sd of SIDES){
+      const q = anchorPt(it, sd); const d = Math.hypot(q[0] - px, q[1] - py);
+      if (d < bd){ bd = d; best = {pid:it.pid, s:sd, d, it}; }
+    }
+  }
+  return best && bd <= radius ? best : null;
+}
+function nearestSide(it, px, py){
+  let best = 'b', bd = 1e9;
+  for (const s of SIDES){ const p = anchorPt(it, s); const d = Math.hypot(p[0] - px, p[1] - py); if (d < bd){ bd = d; best = s; } }
+  return best;
+}
+
+/* ---------- roster helpers ---------- */
+function yearOf(gid){ const m = /^(\d{2})/.exec(gid || ''); return m ? m[1] : null; }
+function colorOfGroup(gid){
+  const y = yearOf(gid);
+  const key = y && S.cfg && S.cfg.colors ? S.cfg.colors[y] : null;
+  return key && PAL[key] ? PAL[key].c : NONE_COLOR;
+}
+function computeRoster(){
+  const idx = {}; const byFam = new Map();
+  for (const g of (S.cfg?.groups || [])) for (const m of g.members){
+    const rec = {...m, g:g.id};
+    idx[m.id] = rec;
+    const k = normFam(m.fam);
+    if (!byFam.has(k)) byFam.set(k, []);
+    byFam.get(k).push(rec);
+  }
+  for (const arr of byFam.values()){
+    if (arr.length === 1){ arr[0].disp = arr[0].fam; arr[0].needY = false; continue; }
+    let len = 1;
+    while (len < 4){
+      const keys = arr.map(m => (m.yomi || '').slice(0, len)).filter(Boolean);
+      if (new Set(keys).size === keys.length) break;
+      len++;
+    }
+    for (const m of arr){ m.needY = true; m.disp = m.fam + (m.yomi ? m.yomi.slice(0, len) : '？'); }
+  }
+  S.idx = idx;
+}
+function itemLabel(it){ const m = S.idx[it.mid]; return m ? m.disp : (it.n || '？'); }
+function itemColor(it){ const m = S.idx[it.mid]; return colorOfGroup(m ? m.g : it.g); }
+
+/* ---------- storage: shared db when available, this browser otherwise ---------- */
+function makeWriter(fn){
+  let running = false, queued = null, has = false;
+  async function pump(){
+    running = true;
+    while (has){ const d = queued; has = false; queued = null;
+      try { await fn(d); setStatus(); }
+      catch (e){
+        if (e && e.code === 'unavailable'){ await new Promise(r => setTimeout(r, 600 + Math.random() * 800)); try { await fn(d); } catch(e2){ onWriteError(e2); } }
+        else onWriteError(e);
+      }
+    }
+    running = false;
+  }
+  return (d) => { queued = d; has = true; if (!running) pump(); };
+}
+function onWriteError(e){
+  const code = e && e.code;
+  if (code === 'invalid_argument' && S.store === 'cloud'){ setReadOnly(true); toast('この名簿・ブックを変更する権限がありません（閲覧のみ）', 'warn'); }
+  else if (code === 'quota_exceeded'){ toast('保存できる件数の上限に達しました。古いブックを削除してください', 'warn'); }
+  else toast('保存に失敗しました。通信を確認して，もう一度操作してください', 'warn');
+}
+/* who may change the shared data: owner, or whoever the platform says may write.
+   Outside viewers (public link, Viewer/Commenter) get a read-only screen from the start;
+   when the platform says nothing, editing stays on and a refused write decides. */
+async function canWriteShared(){
+  let u = null;
+  try { if (window.claude && typeof window.claude.use === 'function') u = await window.claude.use('user'); } catch(e){ u = null; }
+  if (!u) return null;
+  try {
+    if (await u.isOwner()) return true;
+    const c = await u.can('data.write');
+    if (c === true || c === false) return c;
+    return (await u.canEdit()) ? true : false;
+  } catch(e){ return null; }
+}
+function setReadOnly(v){
+  if (S.readOnly === v) return;
+  S.readOnly = v;
+  document.body.classList.toggle('ro', v);
+  if (v){ S.mode = 'normal'; S.rosterSel = null; S.sel = null; S.chainSrc = null; S.dirtyBook = false; S.dirtyCfg = false; try { hidePop(); } catch(_){} }
+  setStatus();
+  try { renderAll(); if (S.dlg === 'books') renderBooksDialog(); } catch(_){}
+}
+const Store = {
+  db: null, unsubBook: null, writers: {},
+  async init(){
+    let db = null;
+    if (window.__needKey){ S.store = 'nokey'; setStatus(); onConfig(null, {hasPendingWrites:false}); S.books = []; renderAll(); return; }
+    if (window.__gasdb) db = window.__gasdb; /* Google Apps Script 版 */
+    else try { if (window.claude && typeof window.claude.use === 'function') db = await window.claude.use('db'); } catch(e){ db = null; }
+    if (db){ this.db = db; S.store = 'cloud'; } else { S.store = 'local'; }
+    setStatus();
+    if (db && !window.__gasdb) canWriteShared().then(w => { if (w === false) setReadOnly(true); });
+    if (S.store === 'cloud'){
+      db.doc('config/main').onSnapshot(snap => onConfig(snap.exists ? snap.data() : null, snap.metadata), e => onSubError(e));
+      db.collection('books').orderBy('createdAt', 'desc').limit(500).onSnapshot(q => onBooks(q.docs.filter(d => d.exists).map(d => ({id:d.id, ...d.data()}))), e => onSubError(e));
+    } else {
+      onConfig(LS.get('men.config', null), {hasPendingWrites:false});
+      onBooks(LS.get('men.books', []));
+    }
+  },
+  saveConfig(cfg){
+    if (S.store === 'cloud'){ (this.writers.cfg ||= makeWriter(d => this.db.doc('config/main').set(d)))(clone(cfg)); }
+    else LS.set('men.config', cfg);
+  },
+  watchBook(id){
+    if (this.unsubBook){ this.unsubBook(); this.unsubBook = null; }
+    if (!id) return;
+    if (S.store === 'cloud'){
+      this.unsubBook = this.db.doc('bookdata/' + id).onSnapshot(snap => onBookData(id, snap.exists ? snap.data() : null, snap.metadata), e => onSubError(e));
+    } else {
+      const d = LS.get('men.book.' + id, null);
+      setTimeout(() => onBookData(id, d, {hasPendingWrites:false}), 0);
+    }
+  },
+  saveBookData(id, data){
+    if (S.store === 'cloud'){ (this.writers['b' + id] ||= makeWriter(d => this.db.doc('bookdata/' + id).set(d)))(clone(data)); }
+    else LS.set('men.book.' + id, data);
+  },
+  async createBook(meta, data){
+    if (S.store === 'cloud'){
+      await this.db.doc('books/' + meta.id).set({title:meta.title, createdAt:meta.createdAt});
+      await this.db.doc('bookdata/' + meta.id).set(data);
+    } else {
+      LS.set('men.book.' + meta.id, data);
+      const list = LS.get('men.books', []); list.unshift({id:meta.id, title:meta.title, createdAt:meta.createdAt});
+      LS.set('men.books', list); onBooks(list);
+    }
+  },
+  async renameBook(id, title){
+    if (S.store === 'cloud') await this.db.doc('books/' + id).update({title});
+    else { const list = LS.get('men.books', []); const b = list.find(x => x.id === id); if (b) b.title = title; LS.set('men.books', list); onBooks(list); }
+  },
+  async deleteBook(id){
+    if (S.store === 'cloud'){ await this.db.doc('books/' + id).delete(); await this.db.doc('bookdata/' + id).delete(); }
+    else { LS.del('men.book.' + id); const list = LS.get('men.books', []).filter(x => x.id !== id); LS.set('men.books', list); onBooks(list); }
+  },
+};
+function onSubError(e){
+  if (e && e.code === 'revoked'){ setReadOnly(true); return; }
+  if (S.books === null || !S.cfg || !S.cfg.groups.length){   /* 最初の読み込みから失敗：つながっていないことをはっきり示す */
+    S.connErr = String((e && (e.message || e.code)) || 'error').slice(0, 120); setStatus(); renderEmpty(); return;
+  }
+  toast('共有データの受信が止まりました。ページを開き直してください', 'warn');
+}
+function setStatus(){
+  const el = $('status');
+  if (S.store === 'loading'){ el.textContent = '接続中…'; el.className = 'status'; return; }
+  if (S.connErr){ el.textContent = '保存先に接続できません'; el.className = 'status local'; el.title = S.connErr; return; }
+  if (S.store === 'nokey'){ el.textContent = '保存先に未接続'; el.className = 'status local'; return; }
+  if (S.store === 'local'){ el.textContent = 'この端末にだけ保存中'; el.className = 'status local'; el.title = 'この表示では共有の保存先が使えないため，このブラウザの中にだけ保存しています'; return; }
+  el.textContent = S.readOnly ? '閲覧のみ' : '共有に保存済み'; el.className = 'status' + (S.readOnly ? ' local' : ''); el.title = '';
+}
+
+/* ---------- state ---------- */
+const S = {
+  store:'loading', readOnly:false, cfg:null, idx:{}, books:null, bookId:null, book:null, cur:0,
+  mode:'normal', sel:null, rosterSel:null, chainSrc:null, zoom:0,
+  undo:[], redo:[], rev:0, dirtyBook:false, dirtyCfg:false, rosterEdit:false,
+  open:LS.get('men.open', {}), filter:'', rosterOpen:LS.get('men.rosterOpen', true), loadedBook:null,
+};
+function page(){ return S.book ? S.book.pages[S.cur] : null; }
+function newPage(){ return {id:uid('p'), title:'', mode:3, items:[], arrows:[]}; }
+
+/* shared data may be written by anyone who can open the page: keep only well-formed fields
+   (ids limited to safe characters, texts to plain strings of sane length) before anything is drawn */
+const SAFE_ID = /^[A-Za-z0-9_-]{1,64}$/;
+const sid = (v, pre) => (typeof v === 'string' && SAFE_ID.test(v)) ? v : uid(pre);
+const txt = (v, n) => (v == null ? '' : String(v)).slice(0, n);
+const int = (v, lo, hi) => { const n = Math.round(Number(v)); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : lo; };
+function cleanCfg(d){
+  if (!d || typeof d !== 'object') return null;
+  const colors = {};
+  if (d.colors && typeof d.colors === 'object') for (const [y, k] of Object.entries(d.colors)) if (/^\d{2}$/.test(y) && PAL[k]) colors[y] = k;
+  const groups = (Array.isArray(d.groups) ? d.groups : []).filter(g => g && typeof g === 'object').slice(0, 60).map(g => ({
+    id: txt(g.id, 20) || '？',
+    members: (Array.isArray(g.members) ? g.members : []).filter(m => m && typeof m === 'object').slice(0, 300)
+      .map(m => ({id:sid(m.id, 'm'), fam:txt(m.fam, 30), giv:txt(m.giv, 30), yomi:txt(m.yomi, 30)})),
+  }));
+  return {...d, colors, groups};
+}
+function cleanPages(pages){
+  return pages.filter(p => p && typeof p === 'object').slice(0, 200).map(p => ({
+    id: sid(p.id, 'p'), title: txt(p.title, 120), mode: p.mode === 4 ? 4 : 3,
+    items: (Array.isArray(p.items) ? p.items : []).filter(it => it && typeof it === 'object').slice(0, 300).map(it => ({
+      pid: sid(it.pid, 'i'), mid: typeof it.mid === 'string' && SAFE_ID.test(it.mid) ? it.mid : '', n: txt(it.n, 30), g: txt(it.g, 20),
+      r: int(it.r, 0, 11), x: int(it.x, 0, 14), star: !!it.star})),
+    arrows: (Array.isArray(p.arrows) ? p.arrows : []).filter(a => a && a.a && a.b).slice(0, 400).map(a => ({
+      aid: sid(a.aid, 'a'),
+      a: {pid: typeof a.a.pid === 'string' && SAFE_ID.test(a.a.pid) ? a.a.pid : '', s: SIDES.includes(a.a.s) ? a.a.s : 'b'},
+      b: {pid: typeof a.b.pid === 'string' && SAFE_ID.test(a.b.pid) ? a.b.pid : '', s: SIDES.includes(a.b.s) ? a.b.s : 't'}})),
+  }));
+}
+function onConfig(d, meta){
+  if (meta && meta.hasPendingWrites) return;
+  if (S.connErr){ S.connErr = null; setStatus(); }
+  S.noData = S.store === 'cloud' && !window.__gasdb && !d && !(meta && meta.fromCache);
+  if (S.dirtyCfg && d) return;
+  d = cleanCfg(d);
+  S.cfg = d ? clone(d) : {groups:[], colors:{...DEFAULT_COLORS}};
+  if (!S.cfg.colors) S.cfg.colors = {...DEFAULT_COLORS};
+  if (!Array.isArray(S.cfg.groups)) S.cfg.groups = [];
+  computeRoster(); renderRoster(); renderCourt();
+}
+function onBooks(list){
+  list = list.filter(b => b && SAFE_ID.test(String(b.id))).map(b => ({id:b.id, title:txt(b.title, 80), createdAt:Number(b.createdAt) || 0}));
+  S.books = list.slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  if (S.bookId && !S.books.some(b => b.id === S.bookId)){ S.bookId = null; S.book = null; Store.watchBook(null); }
+  if (!S.bookId && S.books.length){
+    const last = LS.get('men.lastBook', null);
+    openBook(S.books.some(b => b.id === last) ? last : S.books[0].id);
+  }
+  renderTop(); renderEmpty();
+  if (S.dlg === 'books') renderBooksDialog();
+}
+function openBook(id){
+  if (S.bookId === id) return;
+  flushBook();
+  S.bookId = id; S.book = null; S.cur = 0; S.undo = []; S.redo = []; S.sel = null; S.chainSrc = null; S.loadedBook = null;
+  LS.set('men.lastBook', id);
+  Store.watchBook(id);
+  renderAll();
+}
+function onBookData(id, d, meta){
+  if (id !== S.bookId) return;
+  if (meta && meta.hasPendingWrites) return;
+  if (d && d.by === CLIENT && d.rev <= S.rev && S.loadedBook === id) return;
+  if (S.dirtyBook && S.loadedBook === id) return;
+  const first = S.loadedBook !== id;
+  const got = d && Array.isArray(d.pages) ? cleanPages(d.pages) : [];
+  const pages = got.length ? got : [newPage()];
+  for (const p of pages){ p.items ||= []; p.arrows ||= []; p.mode = p.mode === 4 ? 4 : 3; }
+  S.book = {pages};
+  S.loadedBook = id;
+  if (S.cur >= pages.length) S.cur = pages.length - 1;
+  if (!first){ S.undo = []; S.redo = []; S.sel = null; toast('ほかの人の変更を反映しました'); }
+  renderAll();
+}
+let saveTimer = null;
+function scheduleSave(){
+  S.dirtyBook = true;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flushBook, 450);
+}
+function flushBook(){
+  clearTimeout(saveTimer);
+  if (!S.dirtyBook || !S.bookId || !S.book) { S.dirtyBook = false; return; }
+  S.rev++;
+  Store.saveBookData(S.bookId, {pages:S.book.pages, by:CLIENT, rev:S.rev, at:Date.now()});
+  S.dirtyBook = false;
+}
+let cfgTimer = null;
+function saveCfg(){
+  S.dirtyCfg = true; computeRoster();
+  clearTimeout(cfgTimer);
+  cfgTimer = setTimeout(() => { Store.saveConfig(S.cfg); S.dirtyCfg = false; }, 300);
+}
+/* every change to the book goes through commit(): history + save + render */
+function snapshot(){ return JSON.stringify({pages:S.book.pages, cur:S.cur}); }
+function commit(fn, opts = {}){
+  if (!S.book) return;
+  if (S.readOnly){ toast('閲覧のみのため変更できません', 'warn'); return; }
+  S.undo.push(snapshot()); if (S.undo.length > 120) S.undo.shift();
+  S.redo = [];
+  fn(page());
+  scheduleSave();
+  if (!opts.noRender) renderAll();
+}
+function undo(){
+  if (!S.undo.length) return;
+  S.redo.push(snapshot());
+  const st = JSON.parse(S.undo.pop()); S.book.pages = st.pages; S.cur = Math.min(st.cur, st.pages.length - 1);
+  S.sel = null; S.chainSrc = null; scheduleSave(); renderAll();
+}
+function redo(){
+  if (!S.redo.length) return;
+  S.undo.push(snapshot());
+  const st = JSON.parse(S.redo.pop()); S.book.pages = st.pages; S.cur = Math.min(st.cur, st.pages.length - 1);
+  S.sel = null; S.chainSrc = null; scheduleSave(); renderAll();
+}
+
+/* ---------- page operations ---------- */
+function occupant(p, slot, exceptPid){ return p.items.find(it => it.pid !== exceptPid && overlaps(it, slot)) || null; }
+function dupCount(p, mid){ return p.items.filter(it => it.mid === mid).length; }
+function placeMember(mid, slot){
+  const p = page(); if (!p || !slot || !validX(p.mode, slot.x)) return;
+  const m = S.idx[mid]; if (!m) return;
+  const occ = occupant(p, slot, null);
+  const already = p.items.some(it => it.mid === mid && (!occ || it.pid !== occ.pid));
+  if (occ && occ.r === slot.r && occ.x === slot.x){
+    const prev = itemLabel(occ);
+    commit(pg => { const it = pg.items.find(i => i.pid === occ.pid); it.mid = mid; it.n = m.disp; it.g = m.g; });
+    toast(`${prev} を ${m.disp} に置き換えました`, already ? 'warn' : '', true);
+  } else if (occ){
+    toast('そのますは隣の名前と重なるため置けません', 'warn'); return;
+  } else {
+    commit(pg => pg.items.push({pid:uid('i'), mid, n:m.disp, g:m.g, r:slot.r, x:slot.x, star:false}));
+  }
+  if (already) toast(`${m.disp} はこのページに既にいます（重複して配置）`, 'warn', true);
+}
+function moveItem(pid, slot){
+  const p = page(); if (!p || !slot || !validX(p.mode, slot.x)) return false;
+  const it = p.items.find(i => i.pid === pid); if (!it) return false;
+  if (it.r === slot.r && it.x === slot.x) return false;
+  const others = p.items.filter(i => i.pid !== pid && overlaps(i, slot));
+  if (others.length === 0){ commit(pg => { const t = pg.items.find(i => i.pid === pid); t.r = slot.r; t.x = slot.x; }); return true; }
+  if (others.length === 1 && others[0].r === slot.r && others[0].x === slot.x){
+    const o = others[0];
+    const test = {...o, r:it.r, x:it.x};
+    const clash = p.items.some(i => i.pid !== pid && i.pid !== o.pid && overlaps(i, test));
+    if (!clash){ commit(pg => { const a = pg.items.find(i => i.pid === pid), b = pg.items.find(i => i.pid === o.pid); b.r = a.r; b.x = a.x; a.r = slot.r; a.x = slot.x; }); return true; }
+  }
+  toast('そこには移動できません（ほかの名前と重なります）', 'warn');
+  return false;
+}
+function removeItem(pid){ commit(pg => { pg.items = pg.items.filter(i => i.pid !== pid); pg.arrows = pg.arrows.filter(a => a.a.pid !== pid && a.b.pid !== pid); }); S.sel = null; renderAll(); }
+function toggleStar(pid){ commit(pg => { const it = pg.items.find(i => i.pid === pid); it.star = !it.star; }); }
+function addArrow(a, b){
+  if (!a || !b || a.pid === b.pid) return;
+  commit(pg => pg.arrows.push({aid:uid('a'), a, b}));
+}
+function setMode(mode){
+  const p = page(); if (!p || p.mode === mode) return;
+  let moved = 0;
+  commit(pg => {
+    pg.mode = mode;
+    const keep = pg.items.filter(it => validX(mode, it.x));
+    const fix = pg.items.filter(it => !validX(mode, it.x));
+    for (const it of fix){
+      const cands = slotsOf(mode).filter(s => s.r === it.r).sort((a, b) => Math.abs(a.x - it.x) - Math.abs(b.x - it.x) || (a.x % 2) - (b.x % 2) || a.x - b.x);
+      let spot = cands.find(s => !keep.some(k => overlaps(k, s)));
+      if (!spot) spot = slotsOf(mode).sort((a, b) => Math.abs(a.r - it.r) * 3 + Math.abs(a.x - it.x) - (Math.abs(b.r - it.r) * 3 + Math.abs(b.x - it.x))).find(s => !keep.some(k => overlaps(k, s)));
+      if (spot){ it.r = spot.r; it.x = spot.x; keep.push(it); moved++; }
+      else { pg.arrows = pg.arrows.filter(a => a.a.pid !== it.pid && a.b.pid !== it.pid); }
+    }
+    pg.items = keep;
+  });
+  if (moved) toast(`${moved} 人の位置を近くのますへ移しました`, '', true);
+}
+
+/* ---------- court rendering ---------- */
+const svg = $('court');
+const NS = 'http://www.w3.org/2000/svg';
+let drag = null; /* current pointer interaction */
+function renderCourt(){
+  const p = page();
+  const vb = pageBounds(p);
+  S.vb = vb;
+  svg.setAttribute('viewBox', `${vb.x} ${vb.y} ${vb.w} ${vb.h}`);
+  sizeCourt();
+  if (!p){ svg.innerHTML = ''; return; }
+  const mode = p.mode;
+  let s = '';
+  /* frame, 面間, lines, net */
+  s += `<rect class="c-frame" x="${G.X0}" y="${G.FY0}" width="${8 * G.colW}" height="${G.FY1 - G.FY0}"/>`;
+  for (const gc of gapCols(mode)) s += `<rect class="c-gap" x="${G.X0 + gc * G.colW + 1}" y="${G.FY0 + 1}" width="${G.colW - 2}" height="${G.FY1 - G.FY0 - 2}"/>`;
+  for (const v of vLines(mode)) s += `<line class="c-line" x1="${G.X0 + v * G.colW}" y1="${G.FY0}" x2="${G.X0 + v * G.colW}" y2="${G.FY1}"/>`;
+  s += `<line class="c-net" x1="${G.X0}" y1="${G.NY}" x2="${G.X0 + 8 * G.colW}" y2="${G.NY}"/>`;
+  s += `<rect class="c-frame" x="${G.X0}" y="${G.FY0}" width="${8 * G.colW}" height="${G.FY1 - G.FY0}" style="fill:none"/>`;
+  /* empty cells (dashed) */
+  const placing = !!(S.rosterSel || (drag && (drag.kind === 'roster' || drag.kind === 'item') && drag.live));
+  s += '<g id="gCells">';
+  for (const sl of slotsOf(mode)){
+    const isCtr = sl.x % 2 === 1;
+    if (isCtr && !placing) continue;
+    if (p.items.some(it => overlaps(it, sl) && !(drag && drag.kind === 'item' && drag.pid === it.pid && drag.live))) continue;
+    if (isCtr && S.mode === 'arrow') continue;
+    const ins = isCtr ? 5 : 0;
+    s += `<rect class="cell${isCtr ? ' ctr' : ''}" x="${colX(sl.x) - G.cellW / 2 + ins}" y="${rowY(sl.r) - G.cellH / 2 + ins}" width="${G.cellW - 2 * ins}" height="${G.cellH - 2 * ins}" rx="3"/>`;
+  }
+  s += '</g><g id="gTarget"></g>';
+  /* arrows: the tap targets stay under the names (a tap on a name selects the name);
+     the visible lines and heads are drawn above the names and the side dots so they are never hidden */
+  const byPid = Object.fromEntries(p.items.map(it => [it.pid, it]));
+  const env = routeEnv(p);
+  const geoms = p.arrows.map(a => [a, geomOf(p, a, env)]).filter(x => x[1]);
+  s += '<g id="gArrowHits">';
+  for (const [a, g] of geoms) s += `<g class="arrow" data-aid="${a.aid}"><path class="hit" d="${curveD(g)}"/></g>`;
+  s += '</g>';
+  /* items */
+  s += '<g id="gItems">';
+  for (const it of p.items) s += itemSvg(it, p);
+  s += '</g>';
+  /* side midpoints: shown while drawing arrows, and faintly while an arrow is selected */
+  const arrowSel = S.sel && S.sel.type === 'arrow';
+  if (S.mode === 'arrow' || arrowSel){
+    s += '<g id="gAnchors" pointer-events="none">';
+    for (const it of p.items) for (const sd of SIDES){
+      const [ax, ay] = anchorPt(it, sd);
+      const on = S.mode === 'arrow' && S.chainSrc && S.chainSrc.pid === it.pid && S.chainSrc.s === sd;
+      s += `<circle class="anchor${on ? ' on' : ''}${S.mode === 'arrow' ? '' : ' faint'}" cx="${ax}" cy="${ay}" r="${S.mode === 'arrow' ? 6 : 4.5}"/>`;
+    }
+    s += '</g>';
+  }
+  s += '<g id="gArrows" pointer-events="none">';
+  for (const [a, g] of geoms) s += arrowSvg(a, g);
+  s += '</g>';
+  /* arrow end handles */
+  if (S.sel && S.sel.type === 'arrow'){
+    const a = p.arrows.find(x => x.aid === S.sel.aid);
+    if (a && byPid[a.a.pid] && byPid[a.b.pid]){
+      const p1 = anchorPt(byPid[a.a.pid], a.a.s), p2 = anchorPt(byPid[a.b.pid], a.b.s);
+      s += `<circle class="handle" data-handle="${a.aid}:a" cx="${p1[0]}" cy="${p1[1]}" r="8"/><circle class="handle" data-handle="${a.aid}:b" cx="${p2[0]}" cy="${p2[1]}" r="8"/>`;
+    }
+  }
+  s += '<g id="gTemp"></g><g id="gSnap" pointer-events="none"></g>';
+  svg.innerHTML = s;
+}
+function curveD(g){ return `M${g.p1[0]},${g.p1[1]} C${g.c1[0]},${g.c1[1]} ${g.c2[0]},${g.c2[1]} ${g.end[0]},${g.end[1]}`; }
+function headD(g){ return `M${g.tip[0]},${g.tip[1]} L${g.h1[0]},${g.h1[1]} L${g.h2[0]},${g.h2[1]} Z`; }
+function arrowSvg(a, g){
+  const sel = S.sel && S.sel.type === 'arrow' && S.sel.aid === a.aid;
+  return `<g class="arrow${sel ? ' sel' : ''}" data-aid="${a.aid}"><path class="ln" d="${curveD(g)}"/><path class="head" d="${headD(g)}"/></g>`;
+}
+function itemSvg(it, p){
+  const cx = colX(it.x), cy = rowY(it.r);
+  const label = itemLabel(it);
+  const col = itemColor(it);
+  const gone = !S.idx[it.mid];
+  const dup = dupCount(p, it.mid) > 1;
+  const sel = S.sel && S.sel.type === 'item' && S.sel.pid === it.pid;
+  const src = S.chainSrc && S.chainSrc.pid === it.pid;
+  const fs = label.length > 5 ? Math.max(11, Math.floor(92 / label.length)) : 18;
+  let s = `<g class="item${sel ? ' sel' : ''}${src ? ' src' : ''}${gone ? ' gone' : ''}" data-pid="${it.pid}" transform="translate(${cx},${cy})">`;
+  s += `<rect class="box" x="${-G.cellW / 2}" y="${-G.cellH / 2}" width="${G.cellW}" height="${G.cellH}" rx="3" style="stroke:${col}"/>`;
+  if (sel || src) s += `<rect class="ring" x="${-G.cellW / 2 - 4}" y="${-G.cellH / 2 - 4}" width="${G.cellW + 8}" height="${G.cellH + 8}" rx="6"/>`;
+  s += `<text class="nm" x="0" y="1" text-anchor="middle" dominant-baseline="middle" style="font-size:${fs}px">${esc(label)}</text>`;
+  if (it.star) s += `<text class="star" x="${-G.cellW / 2 + 3}" y="${-G.cellH / 2 + 12}">★</text>`;
+  if (dup) s += `<circle class="dup" cx="${G.cellW / 2 - 2}" cy="${-G.cellH / 2 + 2}" r="7"><title>このページで重複しています</title></circle><text class="dupt" x="${G.cellW / 2 - 2}" y="${-G.cellH / 2 + 2.5}" text-anchor="middle" dominant-baseline="middle">!</text>`;
+  s += '</g>';
+  return s;
+}
+function sizeCourt(){
+  const sc = $('courtScroll');
+  const avail = Math.max(280, sc.clientWidth - 18);
+  const availH = Math.max(200, sc.clientHeight - 18);
+  const vb = S.vb || {w:G.W, h:G.H};
+  const fit = Math.min(avail / vb.w, availH / vb.h);
+  const base = window.innerWidth < 600 ? Math.max(avail / vb.w, 0.56) : Math.max(fit, 0.45);
+  const z = [1, 1.3, 1.6, 2][S.zoom] || 1;
+  const wpx = Math.round(vb.w * base * z);
+  svg.style.width = wpx + 'px';
+  svg.style.height = Math.round(vb.h * base * z) + 'px';
+  sc.style.justifyContent = wpx > avail ? 'flex-start' : 'center';
+}
+function drawTarget(slot, bad){
+  const g = svg.querySelector('#gTarget'); if (!g) return;
+  if (!slot){ g.innerHTML = ''; return; }
+  g.innerHTML = `<rect class="cell tgt${bad ? ' bad' : ''}" x="${colX(slot.x) - G.cellW / 2}" y="${rowY(slot.r) - G.cellH / 2}" width="${G.cellW}" height="${G.cellH}" rx="3"/>`;
+}
+function drawTemp(p1, s1, pt){
+  const g = svg.querySelector('#gTemp'); if (!g) return;
+  if (!p1){ g.innerHTML = ''; return; }
+  const n = NORMAL[s1]; const d = Math.max(30, Math.hypot(pt[0] - p1[0], pt[1] - p1[1]) * 0.4);
+  g.innerHTML = `<path class="tmp" d="M${p1[0]},${p1[1]} C${p1[0] + n[0] * d},${p1[1] + n[1] * d} ${pt[0]},${pt[1]} ${pt[0]},${pt[1]}"/>`;
+}
+/* preview of the arrow being drawn or re-attached, snapped to a side midpoint */
+function drawPreview(from, to, pt){
+  const gT = svg.querySelector('#gTemp'), gS = svg.querySelector('#gSnap'); if (!gT || !gS) return;
+  const p = page(); const byPid = Object.fromEntries(p.items.map(it => [it.pid, it]));
+  const A = from && byPid[from.pid], B = to && byPid[to.pid];
+  if (A && B){
+    const g = arrowGeom(anchorPt(A, from.s), from.s, anchorPt(B, to.s), to.s, {...routeEnv(p), a:A.pid, b:B.pid});
+    gT.innerHTML = `<g class="arrow preview"><path class="ln" d="${curveD(g)}"/><path class="head" d="${headD(g)}"/></g>`;
+  } else if (A && pt){
+    const p1 = anchorPt(A, from.s), n = NORMAL[from.s], d = Math.max(30, Math.hypot(pt[0] - p1[0], pt[1] - p1[1]) * 0.4);
+    gT.innerHTML = `<path class="tmp" d="M${p1[0]},${p1[1]} C${p1[0] + n[0] * d},${p1[1] + n[1] * d} ${pt[0]},${pt[1]} ${pt[0]},${pt[1]}"/>`;
+  } else if (B && pt){
+    const p2 = anchorPt(B, to.s), n = NORMAL[to.s], d = Math.max(30, Math.hypot(pt[0] - p2[0], pt[1] - p2[1]) * 0.4);
+    gT.innerHTML = `<path class="tmp" d="M${pt[0]},${pt[1]} C${pt[0]},${pt[1]} ${p2[0] + n[0] * d},${p2[1] + n[1] * d} ${p2[0]},${p2[1]}"/>`;
+  } else gT.innerHTML = '';
+  const snap = [from, to].find(x => x && x.snap);
+  if (snap && byPid[snap.pid]){ const q = anchorPt(byPid[snap.pid], snap.s); gS.innerHTML = `<circle class="snap" cx="${q[0]}" cy="${q[1]}" r="11"/>`; }
+  else gS.innerHTML = '';
+}
+function svgPt(clientX, clientY){
+  const m = svg.getScreenCTM(); if (!m) return [0, 0];
+  const pt = svg.createSVGPoint(); pt.x = clientX; pt.y = clientY;
+  const r = pt.matrixTransform(m.inverse()); return [r.x, r.y];
+}
+function overSvg(clientX, clientY){
+  const r = $('courtScroll').getBoundingClientRect();
+  return clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom;
+}
+function itemAtPoint(px, py, exceptPid){
+  const p = page(); if (!p) return null;
+  let best = null, bd = 1e9;
+  for (const it of p.items){
+    if (it.pid === exceptPid) continue;
+    const cx = colX(it.x), cy = rowY(it.r);
+    const dx = Math.max(0, Math.abs(px - cx) - G.cellW / 2), dy = Math.max(0, Math.abs(py - cy) - G.cellH / 2);
+    const d = Math.hypot(dx, dy);
+    if (d < 14 && d < bd){ bd = d; best = it; }
+  }
+  return best;
+}
+
+/* ---------- pointer interactions on the court ---------- */
+const MOVE_TOL = 6;
+/* a press counts as "on a side midpoint" when it is near the midpoint and nearer to it than to the box centre */
+function anchorUnder(px, py){
+  const an = nearestAnchor(px, py, 15, null); if (!an) return null;
+  const dc = Math.hypot(px - colX(an.it.x), py - rowY(an.it.r));
+  return an.d < dc * 0.8 ? an : null;
+}
+/* where a dragged arrow end would attach: the nearest midpoint, else the nearest side of the box under the pointer */
+function snapTarget(px, py, exceptPid){
+  const an = nearestAnchor(px, py, 30, exceptPid);
+  if (an) return {pid:an.pid, s:an.s, snap:true};
+  const it = itemAtPoint(px, py, exceptPid);
+  return it ? {pid:it.pid, s:nearestSide(it, px, py), snap:true} : null;
+}
+svg.addEventListener('pointerdown', (e) => {
+  if (!page() || e.button > 0 || S.readOnly) return;
+  hidePop(); closeMenus();
+  const t = e.target.closest('[data-handle],[data-pid],[data-aid]');
+  const [px, py] = svgPt(e.clientX, e.clientY);
+  drag = {id:e.pointerId, sx:e.clientX, sy:e.clientY, live:false, px, py};
+  const an = S.mode === 'arrow' && !(t && t.dataset.handle) ? anchorUnder(px, py) : null;
+  if (t && t.dataset.handle){ const [aid, end] = t.dataset.handle.split(':'); Object.assign(drag, {kind:'end', aid, end}); }
+  else if (an){ Object.assign(drag, {kind:'newArrow', pid:an.pid, s:an.s, onAnchor:true}); }
+  else if (t && t.dataset.pid){ Object.assign(drag, {kind:'item', pid:t.dataset.pid}); }
+  else if (t && t.dataset.aid){ Object.assign(drag, {kind:'arrowTap', aid:t.dataset.aid}); }
+  else Object.assign(drag, {kind:'bg'});
+  if (drag.kind !== 'bg' && drag.kind !== 'arrowTap') e.preventDefault();
+  try { svg.setPointerCapture(e.pointerId); } catch(_){}
+});
+svg.addEventListener('touchstart', (e) => {
+  if (S.mode === 'arrow' || (e.target.closest && e.target.closest('[data-handle],[data-pid]'))) e.preventDefault();
+}, {passive:false});
+svg.addEventListener('pointermove', (e) => {
+  if (!drag || drag.id !== e.pointerId) return;
+  const moved = Math.hypot(e.clientX - drag.sx, e.clientY - drag.sy) > MOVE_TOL;
+  const [px, py] = svgPt(e.clientX, e.clientY);
+  const p = page();
+  if (!drag.live && moved){
+    if (drag.kind === 'item' && S.mode === 'arrow'){
+      const it = p.items.find(i => i.pid === drag.pid);
+      const src = S.chainSrc && S.chainSrc.pid === it.pid && S.chainSrc.s;
+      drag.kind = 'newArrow'; drag.s = src || nearestSide(it, px, py);
+    }
+    if (['item','newArrow','end'].includes(drag.kind)){ drag.live = true; if (drag.kind === 'item') renderCourt(); }
+  }
+  if (!drag.live) return;
+  if (drag.kind === 'item'){
+    const el = svg.querySelector(`[data-pid="${drag.pid}"]`);
+    if (el){ el.setAttribute('transform', `translate(${px},${py})`); el.classList.add('lift'); svg.querySelector('#gItems').appendChild(el); }
+    const slot = slotAt(p.mode, px, py);
+    const ok = slot && validX(p.mode, slot.x) && canDropItem(drag.pid, slot);
+    drawTarget(slot, !ok);
+  } else if (drag.kind === 'newArrow'){
+    const to = snapTarget(px, py, drag.pid);
+    drawPreview({pid:drag.pid, s:drag.s}, to, [px, py]);
+  } else if (drag.kind === 'end'){
+    const a = p.arrows.find(x => x.aid === drag.aid); if (!a) return;
+    const other = drag.end === 'a' ? a.b : a.a;
+    const snap = snapTarget(px, py, other.pid);
+    if (drag.end === 'b') drawPreview({pid:other.pid, s:other.s}, snap, [px, py]);
+    else drawPreview(snap, {pid:other.pid, s:other.s}, [px, py]);
+  }
+});
+function canDropItem(pid, slot){
+  const p = page();
+  const others = p.items.filter(i => i.pid !== pid && overlaps(i, slot));
+  if (!others.length) return true;
+  return others.length === 1 && others[0].r === slot.r && others[0].x === slot.x;
+}
+function endDrag(e, cancelled){
+  if (!drag || drag.id !== e.pointerId) return;
+  const d = drag; drag = null;
+  const [px, py] = svgPt(e.clientX, e.clientY);
+  const p = page(); if (!p){ return; }
+  if (cancelled){ renderCourt(); return; }
+  if (!d.live){
+    /* taps */
+    if (d.kind === 'item') onItemTap(d.pid);
+    else if (d.kind === 'arrowTap'){ S.sel = {type:'arrow', aid:d.aid}; S.chainSrc = null; renderCourt(); showArrowPop(d.aid); }
+    else if (d.kind === 'newArrow'){ d.onAnchor ? onAnchorTap(d.pid, d.s) : onItemTap(d.pid); }
+    else if (d.kind === 'end'){ /* tap on handle: nothing */ }
+    else onBgTap(px, py);
+    return;
+  }
+  if (d.kind === 'item'){
+    const slot = slotAt(p.mode, px, py);
+    if (!(slot && moveItem(d.pid, slot))) renderCourt();
+  } else if (d.kind === 'newArrow'){
+    const to = snapTarget(px, py, d.pid);
+    if (to){ addArrow({pid:d.pid, s:d.s}, {pid:to.pid, s:to.s}); S.chainSrc = {pid:to.pid, s:null}; renderCourt(); setHint(); }
+    else renderCourt();
+  } else if (d.kind === 'end'){
+    const a = p.arrows.find(x => x.aid === d.aid);
+    const other = a && (d.end === 'a' ? a.b : a.a);
+    const to = a && snapTarget(px, py, other.pid);
+    if (a && to && !(a[d.end].pid === to.pid && a[d.end].s === to.s)){
+      commit(pg => { const x = pg.arrows.find(y => y.aid === d.aid); x[d.end] = {pid:to.pid, s:to.s}; });
+      showArrowPop(d.aid);
+    } else renderCourt();
+  }
+}
+svg.addEventListener('pointerup', (e) => endDrag(e, false));
+svg.addEventListener('pointercancel', (e) => endDrag(e, true));
+
+/* arrow mode: the tapped midpoint becomes the start (1st tap) or the end (2nd tap); the chain then continues from the end box */
+function onAnchorTap(pid, s){
+  const p = page();
+  if (S.rosterSel){ onItemTap(pid); return; }
+  const src = S.chainSrc;
+  if (!src){ S.chainSrc = {pid, s}; renderCourt(); setHint(); return; }
+  if (src.pid === pid){ S.chainSrc = {pid, s:src.s === s ? null : s}; renderCourt(); setHint(); return; }
+  const A = p.items.find(i => i.pid === src.pid), B = p.items.find(i => i.pid === pid);
+  const sa = src.s || autoSides(A, B, null, s)[0];
+  S.chainSrc = {pid, s:null};
+  addArrow({pid:src.pid, s:sa}, {pid, s});
+  setHint();
+}
+function onItemTap(pid){
+  const p = page();
+  if (S.rosterSel){ const it = p.items.find(i => i.pid === pid); placeMember(S.rosterSel, {r:it.r, x:it.x}); setRosterSel(null); return; }
+  if (S.mode === 'arrow'){
+    const src = S.chainSrc;
+    if (!src){ S.chainSrc = {pid, s:null}; renderCourt(); setHint(); return; }
+    if (src.pid === pid){ S.chainSrc = null; renderCourt(); setHint(); return; }
+    const A = p.items.find(i => i.pid === src.pid), B = p.items.find(i => i.pid === pid);
+    const [sa, sb] = autoSides(A, B, src.s || null, null);
+    S.chainSrc = {pid, s:null};
+    addArrow({pid:src.pid, s:sa}, {pid, s:sb});
+    setHint();
+    return;
+  }
+  S.sel = {type:'item', pid}; renderCourt(); showItemPop(pid);
+}
+function onBgTap(px, py){
+  const p = page();
+  if (S.rosterSel){
+    const slot = slotAt(p.mode, px, py);
+    if (slot) { placeMember(S.rosterSel, slot); setRosterSel(null); }
+    return;
+  }
+  if (S.mode === 'arrow' && S.chainSrc){ S.chainSrc = null; renderCourt(); setHint(); return; }
+  if (S.sel){ S.sel = null; renderCourt(); }
+}
+
+/* ---------- popover ---------- */
+function popAt(el, html){
+  const pop = $('pop'); pop.innerHTML = html; pop.hidden = false;
+  const st = $('stage').getBoundingClientRect(), r = el.getBoundingClientRect();
+  const pw = pop.offsetWidth, ph = pop.offsetHeight;
+  let left = r.left - st.left + r.width / 2 - pw / 2;
+  left = Math.max(4, Math.min(st.width - pw - 4, left));
+  let top = r.bottom - st.top + 8;
+  if (top + ph > st.height - 4) top = r.top - st.top - ph - 8;
+  pop.style.left = left + 'px'; pop.style.top = Math.max(4, top) + 'px';
+}
+function hidePop(){ $('pop').hidden = true; }
+function showItemPop(pid){
+  const p = page(); const it = p.items.find(i => i.pid === pid); if (!it) return;
+  const el = svg.querySelector(`[data-pid="${pid}"]`); if (!el) return;
+  const m = S.idx[it.mid];
+  const who = m ? `${m.fam} ${m.giv}（${m.g}）` : `${it.n || ''}（名簿から削除済み）`;   /* escaped once, below */
+  const dup = dupCount(p, it.mid) > 1 ? '・このページで重複' : '';
+  popAt(el, `<div class="who">${esc(who)}${dup}</div>
+    <button class="btn" data-act="star">${it.star ? '★を外す' : '★を付ける'}</button>
+    <button class="btn" data-act="arrow">ここから矢印</button>
+    <button class="btn danger" data-act="del">削除</button>`);
+  $('pop').onclick = (e) => {
+    const act = e.target.closest('[data-act]')?.dataset.act; if (!act) return;
+    hidePop();
+    if (act === 'star') toggleStar(pid);
+    else if (act === 'del') removeItem(pid);
+    else if (act === 'arrow'){ setArrowMode(true); S.chainSrc = {pid, s:null}; S.sel = null; renderCourt(); setHint(); }
+  };
+}
+const SIDE_LABEL = {t:'上', b:'下', l:'左', r:'右'};
+function showArrowPop(aid){
+  const p = page(); const a = p.arrows.find(x => x.aid === aid); if (!a) return;
+  const el = svg.querySelector(`[data-aid="${aid}"] .ln`); if (!el) return;
+  const nameOf = (pid) => { const it = p.items.find(i => i.pid === pid); return it ? itemLabel(it) : ''; };
+  const row = (end, label) => `<div class="siderow"><span class="sl">${label}（${esc(nameOf(a[end].pid))}）</span>${['t','b','l','r'].map(sd => `<button class="btn sbtn" data-side="${end}:${sd}" aria-pressed="${a[end].s === sd}" aria-label="${label}を${SIDE_LABEL[sd]}の辺の中点にする">${SIDE_LABEL[sd]}</button>`).join('')}</div>`;
+  popAt(el, `${row('a', '始点')}${row('b', '終点')}
+    <button class="btn" data-act="flip">向きを反転</button><button class="btn danger" data-act="del">削除</button>
+    <div class="who">青緑の丸をつかんで，ほかの名前の辺の中点へ付け替えることもできます</div>`);
+  $('pop').onclick = (e) => {
+    const sb = e.target.closest('[data-side]');
+    if (sb){
+      const [end, sd] = sb.dataset.side.split(':');
+      if (a[end].s !== sd){ commit(pg => { pg.arrows.find(x => x.aid === aid)[end].s = sd; }); showArrowPop(aid); }
+      return;
+    }
+    const act = e.target.closest('[data-act]')?.dataset.act; if (!act) return;
+    hidePop();
+    if (act === 'flip'){ commit(pg => { const x = pg.arrows.find(y => y.aid === aid); const t = x.a; x.a = x.b; x.b = t; }); showArrowPop(aid); }
+    else { commit(pg => { pg.arrows = pg.arrows.filter(x => x.aid !== aid); }); S.sel = null; renderCourt(); }
+  };
+}
+function setArrowMode(on){
+  S.mode = on ? 'arrow' : 'normal'; S.chainSrc = null; S.sel = null;
+  if (on) setRosterSel(null);
+  $('arrowBtn').setAttribute('aria-pressed', on ? 'true' : 'false');
+  hidePop(); renderCourt(); setHint();
+}
+function setHint(){
+  const h = $('hint');
+  if (S.readOnly){ h.textContent = '閲覧のみ：◀ ▶ で時間帯を切り替え，「書き出し」で画像・PDF にできます'; h.className = 'hint'; return; }
+  if (S.rosterSel){ const m = S.idx[S.rosterSel]; h.textContent = `${m ? m.disp : ''} を置くますをタップ`; h.className = 'hint act'; return; }
+  if (S.mode === 'arrow'){
+    h.textContent = S.chainSrc
+      ? (S.chainSrc.s ? `始点は${SIDE_LABEL[S.chainSrc.s]}の中点。つなぐ先の辺の丸（または名前）をタップ` : 'つなぐ先の辺の丸（または名前）をタップ。同じ名前の丸をタップすると始点の辺を選べます。空白で終了')
+      : '始点にする辺の丸をタップ（名前をタップすると辺は自動）。丸から相手の丸へドラッグしても引けます';
+    h.className = 'hint act'; return;
+  }
+  h.textContent = window.matchMedia('(pointer: coarse)').matches ? '名簿の名前をタップしてから，置くますをタップ' : '名簿から名前をドラッグして配置。名前をタップで★・削除';
+  h.className = 'hint';
+}
+
+/* ---------- roster panel ---------- */
+function setRosterSel(mid){
+  S.rosterSel = mid;
+  if (mid && S.mode === 'arrow') setArrowMode(false);
+  const box = $('rSel');
+  if (mid && S.idx[mid]){ box.hidden = false; box.innerHTML = `<span><b>${esc(S.idx[mid].disp)}</b> を選択中：置くますをタップ</span><button class="btn ghost" id="rSelX">やめる</button>`; $('rSelX').onclick = () => setRosterSel(null); }
+  else box.hidden = true;
+  document.querySelectorAll('.mem.picked').forEach(el => el.classList.remove('picked'));
+  if (mid) document.querySelector(`.mem[data-mid="${mid}"]`)?.classList.add('picked');
+  renderCourt(); setHint();
+}
+function renderRoster(){
+  const list = $('rList');
+  if (!S.cfg){ list.innerHTML = '<p class="note" style="padding:10px">名簿を読み込み中…</p>'; return; }
+  const p = page();
+  const counts = {};
+  if (p) for (const it of p.items) counts[it.mid] = (counts[it.mid] || 0) + 1;
+  const f = S.filter.trim();
+  let html = '';
+  if (!S.cfg.groups.length) html += `<p class="note" style="padding:10px;line-height:1.7">名簿がまだありません。下の「名簿を編集」からグループと部員を追加できます。</p>`;
+  for (const g of S.cfg.groups){
+    const col = colorOfGroup(g.id);
+    const mems = g.members.map(m => S.idx[m.id]).filter(m => m && (!f || (m.fam + m.giv + (m.yomi || '') + m.disp).includes(f)));
+    if (f && !mems.length) continue;
+    const open = f ? true : !!S.open[g.id];
+    html += `<div class="grp${open ? ' open' : ''}" data-gid="${esc(g.id)}"><div class="grp-h">
+      <button class="tog" data-tog="${esc(g.id)}" aria-expanded="${open}"><span class="chev">▶</span><span class="sw" style="background:${col}"></span>${esc(g.id)} <span class="cnt">${g.members.length}名</span></button>`;
+    if (S.rosterEdit){
+      html += `<button class="btn icon ghost" data-addm="${esc(g.id)}" aria-label="${esc(g.id)} にメンバーを追加" title="メンバーを追加">＋</button>`;
+      html += `<button class="btn icon ghost" data-delg="${esc(g.id)}" aria-label="${esc(g.id)} を削除" title="グループを削除" style="color:var(--danger)">🗑</button>`;
+    }
+    html += `</div><div class="grp-b">`;
+    for (const m of mems){
+      const n = counts[m.id] || 0;
+      const onp = n ? `<span class="onp${n > 1 ? ' dup' : ''}" title="このページに配置中">${n > 1 ? '重複 ' + n : '配置中'}</span>` : '';
+      const noy = m.needY && !m.yomi ? '<span class="noy">読み未設定</span>' : '';
+      html += `<div class="mem${S.rosterSel === m.id ? ' picked' : ''}" data-mid="${esc(m.id)}" role="button" tabindex="0" aria-label="${esc(m.fam + m.giv)}">
+        <span class="disp" style="border-color:${col}">${esc(m.disp)}</span><span class="full">${esc(m.fam)} ${esc(m.giv)}</span>${noy}${onp}`;
+      if (S.rosterEdit) html += `<button class="edit" data-editm="${esc(m.id)}" aria-label="編集">編集</button><button class="del" data-delm="${esc(m.id)}" aria-label="削除">削除</button>`;
+      html += `</div>`;
+    }
+    if (!mems.length) html += `<p class="note" style="margin:2px 0 4px">メンバーがいません</p>`;
+    html += `</div></div>`;
+  }
+  if (S.rosterEdit) html += `<div class="row" style="padding:8px 4px"><input id="newGroup" placeholder="グループ名（例：27M）" aria-label="新しいグループ名"><button class="btn" id="addGroupBtn">＋グループを追加</button></div>`;
+  list.innerHTML = html;
+  $('rEdit').setAttribute('aria-pressed', S.rosterEdit ? 'true' : 'false');
+  $('rEdit').textContent = S.rosterEdit ? '編集を終える' : '名簿を編集';
+  if (S.rosterEdit){
+    $('addGroupBtn').onclick = () => {
+      const v = $('newGroup').value.trim();
+      if (!v){ toast('グループ名を入力してください（例：27M）', 'warn'); return; }
+      if (S.cfg.groups.some(g => g.id === v)){ toast(`${v} はすでにあります`, 'warn'); return; }
+      S.cfg.groups.push({id:v, members:[]}); S.open[v] = true; LS.set('men.open', S.open);
+      const y = yearOf(v); if (y && !S.cfg.colors[y]) S.cfg.colors[y] = PALETTE[(parseInt(y, 10) - 22 + 600) % 6].key;
+      saveCfg(); renderRoster();
+    };
+  }
+}
+$('rList').addEventListener('click', (e) => {
+  const t = e.target;
+  const tog = t.closest('[data-tog]');
+  if (tog){ const id = tog.dataset.tog; S.open[id] = !S.open[id]; LS.set('men.open', S.open); renderRoster(); return; }
+  const addm = t.closest('[data-addm]'); if (addm){ memberDialog(null, addm.dataset.addm); return; }
+  const delg = t.closest('[data-delg]'); if (delg){ deleteGroupDialog(delg.dataset.delg); return; }
+  const ed = t.closest('[data-editm]'); if (ed){ memberDialog(ed.dataset.editm); return; }
+  const dm = t.closest('[data-delm]'); if (dm){ deleteMemberDialog(dm.dataset.delm); return; }
+});
+$('rList').addEventListener('keydown', (e) => {
+  const mem = e.target.closest('.mem');
+  if (mem && (e.key === 'Enter' || e.key === ' ')){ e.preventDefault(); setRosterSel(S.rosterSel === mem.dataset.mid ? null : mem.dataset.mid); }
+});
+/* drag from roster (mouse/pen: move; touch: long-press then move). Tap selects for tap-to-place. */
+let rd = null;
+$('rList').addEventListener('pointerdown', (e) => {
+  const mem = e.target.closest('.mem'); if (!mem || e.target.closest('button') || e.button > 0) return;
+  if (!page()) return;
+  rd = {id:e.pointerId, mid:mem.dataset.mid, sx:e.clientX, sy:e.clientY, live:false, armed:e.pointerType !== 'touch', el:mem, ghost:null, touch:e.pointerType === 'touch'};
+  if (rd.touch) rd.timer = setTimeout(() => { if (rd){ rd.armed = true; mem.classList.add('picked'); navigator.vibrate?.(10); } }, 280);
+});
+document.addEventListener('pointermove', (e) => {
+  if (!rd || rd.id !== e.pointerId) return;
+  const moved = Math.hypot(e.clientX - rd.sx, e.clientY - rd.sy) > MOVE_TOL;
+  if (!rd.live){
+    if (!moved) return;
+    if (!rd.armed){ clearTimeout(rd.timer); rd = null; return; }
+    rd.live = true;
+    try { rd.el.setPointerCapture(e.pointerId); } catch(_){}
+    const m = S.idx[rd.mid];
+    const g = document.createElement('div'); g.className = 'ghost-drag'; g.textContent = m ? m.disp : '';
+    g.style.borderColor = m ? colorOfGroup(m.g) : NONE_COLOR; document.body.appendChild(g); rd.ghost = g;
+    drag = {kind:'roster', live:true}; renderCourt();
+  }
+  rd.ghost.style.left = e.clientX + 'px'; rd.ghost.style.top = e.clientY + 'px';
+  const p = page();
+  if (overSvg(e.clientX, e.clientY)){
+    const [px, py] = svgPt(e.clientX, e.clientY);
+    const slot = slotAt(p.mode, px, py);
+    const occ = slot && occupant(p, slot, null);
+    const bad = !slot || (occ && !(occ.r === slot.r && occ.x === slot.x));
+    drawTarget(slot, bad);
+  } else drawTarget(null);
+});
+document.addEventListener('touchmove', (e) => { if (rd && (rd.armed || rd.live) && rd.touch) e.preventDefault(); }, {passive:false});
+function endRoster(e, cancelled){
+  if (!rd || rd.id !== e.pointerId) return;
+  const r = rd; rd = null; clearTimeout(r.timer);
+  if (r.ghost) r.ghost.remove();
+  if (!r.live){
+    if (!cancelled){ setRosterSel(S.rosterSel === r.mid ? null : r.mid); }
+    else r.el.classList.remove('picked');
+    return;
+  }
+  drag = null;
+  if (!cancelled && overSvg(e.clientX, e.clientY)){
+    const [px, py] = svgPt(e.clientX, e.clientY);
+    const slot = slotAt(page().mode, px, py);
+    if (slot){ placeMember(r.mid, slot); renderRoster(); return; }
+  }
+  renderCourt(); renderRoster();
+}
+document.addEventListener('pointerup', (e) => endRoster(e, false));
+document.addEventListener('pointercancel', (e) => endRoster(e, true));
+$('rSearch').addEventListener('input', (e) => { S.filter = e.target.value; renderRoster(); });
+$('rEdit').onclick = () => { S.rosterEdit = !S.rosterEdit; renderRoster(); };
+$('rColors').onclick = () => colorDialog();
+function setRosterOpen(v){
+  S.rosterOpen = v; LS.set('men.rosterOpen', v);
+  $('work').classList.toggle('roster-closed', !v);
+  $('rosterToggle').setAttribute('aria-pressed', v ? 'true' : 'false');
+  $('rosterFold').textContent = v ? '✕' : '▲';
+  $('rosterFold').setAttribute('aria-label', v ? '名簿を閉じる' : '名簿を開く');
+  requestAnimationFrame(() => renderCourt());
+}
+$('rosterToggle').onclick = () => setRosterOpen(!S.rosterOpen);
+$('rosterFold').onclick = (e) => { e.stopPropagation(); setRosterOpen(!S.rosterOpen); };
+document.querySelector('.r-head').addEventListener('click', (e) => { if (window.innerWidth < 900 && !e.target.closest('button')) setRosterOpen(!S.rosterOpen); });
+
+/* ---------- dialogs ---------- */
+function openDlg(name, html, onMount){
+  S.dlg = name;
+  $('dlgRoot').innerHTML = `<div class="scrim" id="scrim"><div class="dlg" role="dialog" aria-modal="true">${html}</div></div>`;
+  $('scrim').addEventListener('pointerdown', (e) => { if (e.target.id === 'scrim') closeDlg(); });
+  onMount && onMount();
+  const f = $('dlgRoot').querySelector('input,select,button'); f && f.focus();
+}
+function closeDlg(){ S.dlg = null; $('dlgRoot').innerHTML = ''; }
+function fmtDate(t){ if (!t) return ''; const d = new Date(t); return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`; }
+function renderBooksDialog(){
+  const box = $('bookList'); if (!box) return;
+  const list = S.books || [];
+  box.innerHTML = list.length ? list.map(b => `
+    <div class="bk${b.id === S.bookId ? ' cur' : ''}" data-bid="${esc(b.id)}">
+      <button class="t" data-open="${esc(b.id)}">${esc(b.title || '（無題）')}</button>
+      <span class="d">${fmtDate(b.createdAt)}</span>
+      ${S.readOnly ? '' : `<button class="btn icon ghost" data-ren="${esc(b.id)}" aria-label="名前を変更" title="名前を変更">✎</button>
+      <button class="btn icon ghost" data-del="${esc(b.id)}" aria-label="削除" title="削除" style="color:var(--danger)">🗑</button>`}
+    </div>`).join('') : '<p class="note">まだブックがありません。</p>';
+}
+function booksDialog(){
+  openDlg('books', `<h3>ブック（1回の正規練ごと）</h3>
+    <div class="row ro-hide"><input id="newBookTitle" placeholder="例：10/3（土）正規練 亥鼻" aria-label="新しいブックの名前"><button class="btn primary" id="newBookBtn">＋ 作成</button></div>
+    <div class="books" id="bookList"></div>
+    <div class="acts"><button class="btn" id="dlgClose">閉じる</button></div>`, () => {
+    renderBooksDialog();
+    $('dlgClose').onclick = closeDlg;
+    $('newBookBtn').onclick = () => createBook($('newBookTitle').value);
+    $('newBookTitle').addEventListener('keydown', (e) => { if (e.key === 'Enter') createBook(e.target.value); });
+    $('bookList').addEventListener('click', async (e) => {
+      const o = e.target.closest('[data-open]'); if (o){ openBook(o.dataset.open); closeDlg(); return; }
+      const rn = e.target.closest('[data-ren]');
+      if (rn){
+        const id = rn.dataset.ren; const b = S.books.find(x => x.id === id);
+        const row = rn.closest('.bk');
+        row.innerHTML = `<input class="t" style="border:1px solid var(--rule);border-radius:6px;padding:5px 8px;background:var(--paper)" value="${esc(b.title)}" aria-label="ブックの名前"><button class="btn primary" data-ok>保存</button>`;
+        const inp = row.querySelector('input'); inp.focus(); inp.select();
+        const save = async () => { const v = inp.value.trim() || '（無題）'; try { await Store.renameBook(id, v); } catch(err){ onWriteError(err); } renderTop(); renderBooksDialog(); };
+        row.querySelector('[data-ok]').onclick = save;
+        inp.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') save(); });
+        return;
+      }
+      const dl = e.target.closest('[data-del]');
+      if (dl){
+        const id = dl.dataset.del; const b = S.books.find(x => x.id === id); const row = dl.closest('.bk');
+        row.innerHTML = `<span class="t" style="color:var(--danger)">「${esc(b.title)}」を削除しますか？ 元に戻せません</span><button class="btn" data-no>やめる</button><button class="btn danger" data-yes>削除する</button>`;
+        row.querySelector('[data-no]').onclick = renderBooksDialog;
+        row.querySelector('[data-yes]').onclick = async () => {
+          try { if (S.bookId === id){ S.dirtyBook = false; clearTimeout(saveTimer); } await Store.deleteBook(id); toast('ブックを削除しました'); } catch(err){ onWriteError(err); }
+        };
+      }
+    });
+  });
+}
+async function createBook(title){
+  if (S.readOnly){ toast('閲覧のみのため作成できません', 'warn'); return; }
+  const t = (title || '').trim();
+  if (!t){ toast('ブックの名前を入力してください', 'warn'); $('newBookTitle')?.focus(); return; }
+  const meta = {id:uid('b'), title:t, createdAt:Date.now()};
+  const data = {pages:[newPage()], by:CLIENT, rev:0, at:Date.now()};
+  try {
+    await Store.createBook(meta, data);
+    if (S.store === 'cloud' && !(S.books || []).some(b => b.id === meta.id)) S.books = [{...meta}, ...(S.books || [])];
+    S.bookId = null; openBook(meta.id); closeDlg(); toast(`「${t}」を作成しました`);
+  } catch(err){ onWriteError(err); }
+}
+function memberDialog(mid, gid){
+  const m = mid ? S.idx[mid] : null;
+  const groups = S.cfg.groups.map(g => `<option value="${esc(g.id)}"${(m ? m.g : gid) === g.id ? ' selected' : ''}>${esc(g.id)}</option>`).join('');
+  openDlg('member', `<h3>${m ? 'メンバーを編集' : 'メンバーを追加'}</h3>
+    <div class="row" style="align-items:stretch">
+      <label style="flex:1">姓<input id="mFam" value="${esc(m?.fam || '')}" autocomplete="off"></label>
+      <label style="flex:1">名<input id="mGiv" value="${esc(m?.giv || '')}" autocomplete="off"></label>
+    </div>
+    <label>名の読み（ひらがな）<input id="mYomi" value="${esc(m?.yomi || '')}" placeholder="例：よしと" autocomplete="off"></label>
+    <p class="note">同じ姓（崎と﨑などの字体違いを含む）の人がいるときは「佐藤よ」のように，姓に名の読みの頭文字を付けて表示します。読みはそのときだけ使います。</p>
+    <label>グループ<select id="mGrp">${groups}</select></label>
+    <div class="acts"><button class="btn" id="mCancel">キャンセル</button><button class="btn primary" id="mSave">${m ? '保存' : '追加'}</button></div>`, () => {
+    $('mCancel').onclick = closeDlg;
+    $('mSave').onclick = () => {
+      const fam = $('mFam').value.trim(), giv = $('mGiv').value.trim(), yomi = $('mYomi').value.trim(), g = $('mGrp').value;
+      if (!fam){ toast('姓を入力してください', 'warn'); return; }
+      if (yomi && !/^[ぁ-んー]+$/.test(yomi)){ toast('読みはひらがなで入力してください', 'warn'); return; }
+      if (m){
+        const from = S.cfg.groups.find(x => x.id === m.g);
+        const rec = from.members.find(x => x.id === m.id);
+        if (g === m.g) Object.assign(rec, {fam, giv, yomi});
+        else { from.members = from.members.filter(x => x.id !== m.id); S.cfg.groups.find(x => x.id === g).members.push({id:m.id, fam, giv, yomi}); }
+      } else {
+        S.cfg.groups.find(x => x.id === g).members.push({id:uid('m'), fam, giv, yomi});
+        S.open[g] = true; LS.set('men.open', S.open);
+      }
+      saveCfg(); closeDlg(); renderRoster(); renderCourt();
+      toast(m ? '保存しました' : `${fam} ${giv} を ${g} に追加しました`);
+    };
+  });
+}
+function deleteMemberDialog(mid){
+  const m = S.idx[mid]; if (!m) return;
+  openDlg('delm', `<h3>${esc(m.fam)} ${esc(m.giv)} を名簿から削除しますか？</h3>
+    <p class="note">すでに振り分けに置かれている名前は，その時点の表示名のまま残ります。</p>
+    <div class="acts"><button class="btn" id="dNo">やめる</button><button class="btn danger" id="dYes">削除する</button></div>`, () => {
+    $('dNo').onclick = closeDlg;
+    $('dYes').onclick = () => {
+      for (const g of S.cfg.groups) g.members = g.members.filter(x => x.id !== mid);
+      if (S.rosterSel === mid) setRosterSel(null);
+      saveCfg(); closeDlg(); renderRoster(); renderCourt(); toast('名簿から削除しました');
+    };
+  });
+}
+function deleteGroupDialog(gid){
+  const g = S.cfg.groups.find(x => x.id === gid); if (!g) return;
+  openDlg('delg', `<h3>グループ ${esc(gid)} を削除しますか？</h3>
+    <p class="note">${g.members.length ? `所属する ${g.members.length} 名も名簿から消えます。` : 'メンバーはいません。'}</p>
+    <div class="acts"><button class="btn" id="dNo">やめる</button><button class="btn danger" id="dYes">削除する</button></div>`, () => {
+    $('dNo').onclick = closeDlg;
+    $('dYes').onclick = () => { S.cfg.groups = S.cfg.groups.filter(x => x.id !== gid); saveCfg(); closeDlg(); renderRoster(); renderCourt(); toast(`${gid} を削除しました`); };
+  });
+}
+function colorDialog(){
+  const years = [...new Set([...Object.keys(S.cfg.colors || {}), ...S.cfg.groups.map(g => yearOf(g.id)).filter(Boolean)])].sort();
+  const rows = years.map(y => `<div class="crow"><span class="yy">${esc(y)}</span><div class="row" role="radiogroup" aria-label="${esc(y)}の色">${PALETTE.map(p => `<button class="swatch" role="radio" aria-checked="${S.cfg.colors[y] === p.key}" aria-label="${p.name}" title="${p.name}" data-y="${esc(y)}" data-k="${p.key}" style="background:${p.c}"></button>`).join('')}</div></div>`).join('');
+  openDlg('colors', `<h3>学年の色（名前の枠の色）</h3><div class="colors" id="colorRows">${rows}</div>
+    <p class="note">入学年度の下2桁（22＝2022年度入学）ごとに，6色から選べます。変更はすべての振り分けに反映されます。</p>
+    <div class="acts"><button class="btn" id="cClose">閉じる</button></div>`, () => {
+    $('cClose').onclick = closeDlg;
+    $('colorRows').addEventListener('click', (e) => {
+      const b = e.target.closest('.swatch'); if (!b) return;
+      S.cfg.colors[b.dataset.y] = b.dataset.k; saveCfg();
+      $('colorRows').querySelectorAll(`.swatch[data-y="${b.dataset.y}"]`).forEach(x => x.setAttribute('aria-checked', x === b ? 'true' : 'false'));
+      renderRoster(); renderCourt();
+    });
+  });
+}
+
+/* ---------- top bar, pages ---------- */
+function renderTop(){
+  const b = (S.books || []).find(x => x.id === S.bookId);
+  $('bookName').textContent = S.books === null ? '読み込み中' : (b ? (b.title || '（無題）') : '未選択');
+  const p = page();
+  const n = S.book ? S.book.pages.length : 0;
+  $('pageNo').textContent = p ? `${S.cur + 1} / ${n}` : '–';
+  const ti = $('pageTitle');
+  if (document.activeElement !== ti) ti.value = p ? (p.title || '') : '';
+  ti.disabled = !p; ti.readOnly = S.readOnly;
+  $('prevPage').disabled = !p || S.cur === 0;
+  const last = p && S.cur === n - 1;
+  $('nextPage').disabled = !p || (S.readOnly && last);
+  const addMode = last && !S.readOnly;
+  $('nextPage').textContent = addMode ? '＋' : '▶';
+  $('nextPage').setAttribute('aria-label', addMode ? '次の時間のページを追加' : '次の時間の振り分け');
+  $('nextPage').title = addMode ? '次の時間のページを追加' : '次の時間の振り分け';
+  $('mode3').setAttribute('aria-pressed', p && p.mode === 3 ? 'true' : 'false');
+  $('mode4').setAttribute('aria-pressed', p && p.mode === 4 ? 'true' : 'false');
+  $('undoBtn').disabled = !S.undo.length; $('redoBtn').disabled = !S.redo.length;
+}
+function renderEmpty(){
+  const el = $('empty');
+  if (S.connErr && !S.bookId){
+    el.hidden = false;
+    el.innerHTML = `<div class="card"><h3>保存先に接続できません</h3><p>通信の状態を確かめて，ページを開き直してください。何度やっても同じときは，この画面を栗山さんに送ってください。</p><p class="note">${esc(S.connErr)}</p></div>`; return;
+  }
+  if (S.books === null || S.bookId){ el.hidden = true; return; }
+  el.hidden = false;
+  if (window.__needKey){
+    el.innerHTML = '<div class="card"><h3>共有されたリンクから開いてください</h3><p>このページは，幹部から送られたリンク（末尾に「#k=」が付いたもの）をそのまま開くと使えます。一度開けば，この端末では次から自動でつながります。</p></div>'; return;
+  }
+  const login = 'Claude にログインした状態で，共有されたリンクから開き直してください。';
+  if (S.store === 'cloud' && S.noData){
+    el.innerHTML = `<div class="card"><h3>共有された振り分けを読み込めません</h3><p>${login}</p></div>`; return;
+  }
+  if (S.readOnly){
+    el.innerHTML = '<div class="card"><h3>まだブックがありません</h3><p>閲覧のみのため，ここからは作成できません。</p></div>'; return;
+  }
+  const localNote = S.store === 'local' ? `<p class="note">共有の保存先に接続できていません。保存済みの振り分けを見るには，${login}下の「作成」はこの端末だけで試す場合に使えます。</p>` : '';
+  el.innerHTML = `<div class="card"><h3>最初のブックを作りましょう</h3>${localNote}
+    <p>1回の正規練につき1冊のブックを作り，その中にメニュー（時間帯）ごとのページを並べます。</p>
+    <div class="row"><input id="firstBook" placeholder="例：10/3（土）正規練 亥鼻" aria-label="ブックの名前"><button class="btn primary" id="firstBookBtn">作成</button></div></div>`;
+  $('firstBookBtn').onclick = () => createBook($('firstBook').value);
+  $('firstBook').addEventListener('keydown', (e) => { if (e.key === 'Enter') createBook(e.target.value); });
+}
+function renderAll(){ renderTop(); renderEmpty(); renderCourt(); renderRoster(); setHint(); }
+function goPage(i){ if (!S.book) return; flushTitle(); S.cur = Math.max(0, Math.min(S.book.pages.length - 1, i)); S.sel = null; S.chainSrc = null; hidePop(); renderAll(); }
+function addPage(copy){
+  commit(() => {
+    const np = copy ? {...clone(page()), id:uid('p'), title:(page().title ? page().title + '（複製）' : '')} : newPage();
+    if (copy){ /* fresh ids so arrows keep pointing at the copies */
+      const map = {};
+      for (const it of np.items){ const n = uid('i'); map[it.pid] = n; it.pid = n; }
+      for (const a of np.arrows){ a.aid = uid('a'); a.a.pid = map[a.a.pid]; a.b.pid = map[a.b.pid]; }
+    } else np.mode = page().mode;
+    S.book.pages.splice(S.cur + 1, 0, np); S.cur++;
+  });
+  toast(copy ? 'ページを複製しました' : 'ページを追加しました', '', true);
+}
+function deletePage(){
+  if (S.book.pages.length === 1){ commit(pg => { pg.items = []; pg.arrows = []; pg.title = ''; }); toast('ページを空にしました', '', true); return; }
+  commit(() => { S.book.pages.splice(S.cur, 1); S.cur = Math.min(S.cur, S.book.pages.length - 1); });
+  toast('ページを削除しました', '', true);
+}
+let titleEditing = false;
+$('pageTitle').addEventListener('input', (e) => {
+  if (!page() || S.readOnly) return;
+  if (!titleEditing){ S.undo.push(snapshot()); S.redo = []; titleEditing = true; }
+  page().title = e.target.value; scheduleSave(); $('undoBtn').disabled = false;
+});
+function flushTitle(){ titleEditing = false; }
+$('pageTitle').addEventListener('blur', flushTitle);
+$('pageTitle').addEventListener('keydown', (e) => { if (e.key === 'Enter') e.target.blur(); });
+$('prevPage').onclick = () => goPage(S.cur - 1);
+$('nextPage').onclick = () => { if (!S.book) return; if (S.cur === S.book.pages.length - 1){ if (!S.readOnly) addPage(false); } else goPage(S.cur + 1); };
+$('mode3').onclick = () => setMode(3);
+$('mode4').onclick = () => setMode(4);
+$('bookBtn').onclick = () => booksDialog();
+$('undoBtn').onclick = undo; $('redoBtn').onclick = redo;
+$('arrowBtn').onclick = () => setArrowMode(S.mode !== 'arrow');
+$('zoomIn').onclick = () => { S.zoom = Math.min(3, S.zoom + 1); sizeCourt(); };
+$('zoomOut').onclick = () => { S.zoom = Math.max(0, S.zoom - 1); sizeCourt(); };
+function toggleMenu(btn, menu){
+  const open = menu.hidden; closeMenus(); menu.hidden = !open; btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+function closeMenus(){ for (const id of ['pageMenu','exportMenu']) $(id).hidden = true; }
+$('pageMenuBtn').onclick = (e) => { e.stopPropagation(); toggleMenu($('pageMenuBtn'), $('pageMenu')); };
+$('exportBtn').onclick = (e) => { e.stopPropagation(); toggleMenu($('exportBtn'), $('exportMenu')); };
+document.addEventListener('pointerdown', (e) => { if (!e.target.closest('.menu-wrap')) closeMenus(); if (!e.target.closest('#pop') && !e.target.closest('#court')) hidePop(); });
+$('pmAdd').onclick = () => { closeMenus(); if (page()) addPage(false); };
+$('pmDup').onclick = () => { closeMenus(); if (page()) addPage(true); };
+$('pmDel').onclick = () => {
+  const b = $('pmDel');
+  if (b.dataset.confirm !== '1'){ b.dataset.confirm = '1'; b.textContent = '本当に削除する（元に戻せます）'; return; }
+  b.dataset.confirm = ''; b.textContent = 'このページを削除'; closeMenus(); if (page()) deletePage();
+};
+$('pageMenuBtn').addEventListener('click', () => { const b = $('pmDel'); b.dataset.confirm = ''; b.textContent = 'このページを削除'; });
+
+/* ---------- toast ---------- */
+let toastTimer = null;
+function toast(msg, kind, withUndo){
+  let el = document.querySelector('.toast');
+  if (!el){ el = document.createElement('div'); document.body.appendChild(el); }
+  el.className = 'toast' + (kind === 'warn' ? ' warn' : '');
+  el.innerHTML = `<span>${esc(msg)}</span>` + (withUndo && S.undo.length ? '<button type="button">元に戻す</button>' : '');
+  const b = el.querySelector('button'); if (b) b.onclick = () => { undo(); el.remove(); };
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => el.remove(), kind === 'warn' ? 4200 : 2800);
+}
+
+/* ---------- keyboard ---------- */
+document.addEventListener('keydown', (e) => {
+  const inField = e.target.matches('input,select,textarea');
+  if (S.readOnly && !(e.key === 'Escape')) return;
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !inField){ e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y' && !inField){ e.preventDefault(); redo(); return; }
+  if (e.key === 'Escape'){
+    if (S.dlg){ closeDlg(); return; }
+    hidePop(); closeMenus();
+    if (S.rosterSel){ setRosterSel(null); return; }
+    if (S.mode === 'arrow'){ if (S.chainSrc){ S.chainSrc = null; renderCourt(); setHint(); } else setArrowMode(false); return; }
+    if (S.sel){ S.sel = null; renderCourt(); }
+    return;
+  }
+  if ((e.key === 'Delete' || e.key === 'Backspace') && !inField && S.sel){
+    e.preventDefault(); hidePop();
+    if (S.sel.type === 'item') removeItem(S.sel.pid);
+    else { const aid = S.sel.aid; commit(pg => { pg.arrows = pg.arrows.filter(x => x.aid !== aid); }); S.sel = null; renderCourt(); }
+  }
+});
+window.addEventListener('resize', () => { hidePop(); sizeCourt(); });
+
+/* ---------- export: draw on canvas, save as JPEG or PDF ---------- */
+const EX = {paper:'#FFFFFF', ink:'#1C2230', line:'#262B35', gap:'#EDF0E8', sub:'#6A7180'};
+const TITLE_H = 54;
+async function fontsReady(){
+  try { await Promise.all([document.fonts.load('700 17px "BIZ UDPGothic"'), document.fonts.load('700 20px "Zen Kaku Gothic New"')]); } catch(_){}
+}
+function drawPage(ctx, p, bookTitle, B){
+  ctx.fillStyle = EX.paper; ctx.fillRect(0, 0, B.w, B.h + TITLE_H);
+  ctx.fillStyle = EX.ink; ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left';
+  ctx.font = '700 22px "Zen Kaku Gothic New","Hiragino Sans","Yu Gothic",sans-serif';
+  ctx.fillText(p.title || '（タイトルなし）', G.M, 34);
+  ctx.textAlign = 'right'; ctx.fillStyle = EX.sub; ctx.font = '500 13px "Zen Kaku Gothic New","Hiragino Sans","Yu Gothic",sans-serif';
+  ctx.fillText(bookTitle || '', B.w - G.M, 32);
+  ctx.save(); ctx.translate(-B.x, TITLE_H - 8 - B.y);
+  const fw = 8 * G.colW, fh = G.FY1 - G.FY0;
+  for (const gc of gapCols(p.mode)){ ctx.fillStyle = EX.gap; ctx.fillRect(G.X0 + gc * G.colW, G.FY0, G.colW, fh); }
+  ctx.strokeStyle = EX.line; ctx.lineWidth = 2;
+  ctx.strokeRect(G.X0, G.FY0, fw, fh);
+  ctx.beginPath();
+  for (const v of vLines(p.mode)){ ctx.moveTo(G.X0 + v * G.colW, G.FY0); ctx.lineTo(G.X0 + v * G.colW, G.FY1); }
+  ctx.moveTo(G.X0, G.NY); ctx.lineTo(G.X0 + fw, G.NY);
+  ctx.stroke();
+  for (const it of p.items){
+    const cx = colX(it.x), cy = rowY(it.r), x = cx - G.cellW / 2, y = cy - G.cellH / 2;
+    ctx.fillStyle = EX.paper; ctx.fillRect(x, y, G.cellW, G.cellH);
+    ctx.strokeStyle = itemColor(it); ctx.lineWidth = 2.6; ctx.strokeRect(x, y, G.cellW, G.cellH);
+    const label = itemLabel(it);
+    let fs = label.length > 5 ? Math.max(11, Math.floor(88 / label.length)) : 17;
+    ctx.font = `700 ${fs}px "BIZ UDPGothic","Hiragino Sans","Yu Gothic",sans-serif`;
+    while (ctx.measureText(label).width > G.cellW - 12 && fs > 9){ fs--; ctx.font = `700 ${fs}px "BIZ UDPGothic","Hiragino Sans","Yu Gothic",sans-serif`; }
+    ctx.fillStyle = EX.ink; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(label, cx, cy + 1);
+    if (it.star){ ctx.font = '13px "Hiragino Sans","Yu Gothic",sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; ctx.fillText('★', x + 3, y + 12); }
+  }
+  /* arrows on top of the names (same as the screen) */
+  const env = routeEnv(p);
+  ctx.lineWidth = 2; ctx.lineJoin = 'round';
+  for (const a of p.arrows){
+    const g = geomOf(p, a, env); if (!g) continue;
+    ctx.strokeStyle = EX.ink; ctx.beginPath(); ctx.moveTo(g.p1[0], g.p1[1]); ctx.bezierCurveTo(g.c1[0], g.c1[1], g.c2[0], g.c2[1], g.end[0], g.end[1]); ctx.stroke();
+    ctx.fillStyle = EX.ink; ctx.beginPath(); ctx.moveTo(g.tip[0], g.tip[1]); ctx.lineTo(g.h1[0], g.h1[1]); ctx.lineTo(g.h2[0], g.h2[1]); ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+async function pageCanvas(p, bookTitle, scale = 2){
+  await fontsReady();
+  const c = document.createElement('canvas');
+  const B = pageBounds(p);
+  c.width = Math.round(B.w * scale); c.height = Math.round((B.h + TITLE_H - 8) * scale);
+  const ctx = c.getContext('2d'); ctx.scale(scale, scale);
+  drawPage(ctx, p, bookTitle, B);
+  return c;
+}
+function canvasJpeg(c){ return new Promise((res, rej) => c.toBlob(b => b ? res(b) : rej(new Error('jpeg')), 'image/jpeg', 0.92)); }
+function makePdf(imgs){
+  const enc = new TextEncoder(); const parts = []; let len = 0; const offs = [];
+  const push = (x) => { const b = typeof x === 'string' ? enc.encode(x) : x; parts.push(b); len += b.length; };
+  const PW = 842, PH = 595, MG = 24;
+  const n = imgs.length; const total = 2 + n * 3;
+  push('%PDF-1.4\n%âãÏÓ\n');
+  offs[1] = len; push('1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n');
+  const kids = imgs.map((_, i) => `${3 + i * 3} 0 R`).join(' ');
+  offs[2] = len; push(`2 0 obj\n<< /Type /Pages /Kids [${kids}] /Count ${n} >>\nendobj\n`);
+  imgs.forEach((im, i) => {
+    const po = 3 + i * 3, co = po + 1, io = po + 2;
+    const s = Math.min((PW - 2 * MG) / im.w, (PH - 2 * MG) / im.h);
+    const w = im.w * s, h = im.h * s, x = (PW - w) / 2, y = (PH - h) / 2;
+    offs[po] = len; push(`${po} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${PW} ${PH}] /Resources << /XObject << /Im${i} ${io} 0 R >> >> /Contents ${co} 0 R >>\nendobj\n`);
+    const cs = `q ${w.toFixed(2)} 0 0 ${h.toFixed(2)} ${x.toFixed(2)} ${y.toFixed(2)} cm /Im${i} Do Q`;
+    offs[co] = len; push(`${co} 0 obj\n<< /Length ${cs.length} >>\nstream\n${cs}\nendstream\nendobj\n`);
+    offs[io] = len; push(`${io} 0 obj\n<< /Type /XObject /Subtype /Image /Width ${im.pw} /Height ${im.ph} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${im.bytes.length} >>\nstream\n`);
+    push(im.bytes); push('\nendstream\nendobj\n');
+  });
+  const xref = len;
+  let x = `xref\n0 ${total + 1}\n0000000000 65535 f \n`;
+  for (let i = 1; i <= total; i++) x += String(offs[i]).padStart(10, '0') + ' 00000 n \n';
+  push(x + `trailer\n<< /Size ${total + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`);
+  const out = new Uint8Array(len); let o = 0; for (const b of parts){ out.set(b, o); o += b.length; }
+  return out;
+}
+function safeName(s){ return (s || '無題').replace(/[\\/:*?"<>|\n\r\t]+/g, '_').replace(/\s+/g, ' ').trim().slice(0, 80) || '無題'; }
+async function offerFile(filename, data){
+  let dl = null;
+  try { dl = window.claude && window.claude.use ? await window.claude.use('downloads') : null; } catch(_){ dl = null; }
+  if (dl){
+    try { await dl.save({filename, data}); toast('書き出しました'); }
+    catch(e){
+      if (e && e.code === 'declined') return;
+      if (e && e.code === 'rate_limited'){ toast('保存の確認画面がすでに開いています', 'warn'); return; }
+      toast('この表示では書き出しができませんでした', 'warn');
+    }
+    return;
+  }
+  if (window.__gasdb){ /* Apps Script 版：埋め込み画面では自動保存が止められることがあるので，押して保存するリンクを出す */
+    const blob = data instanceof Blob ? data : new Blob([data]);
+    const url = URL.createObjectURL(blob); const isImg = /\.jpe?g$/i.test(filename);
+    document.querySelector('.toast')?.remove();
+    openDlg('file', `<h3>書き出し</h3>
+      <p class="note">下のボタンで保存します。保存できないときは${isImg ? '画像を長押しして保存するか，' : ''}ボタンを長押しして「リンク先を開く」などを選んでください。</p>
+      ${isImg ? `<img src="${url}" alt="書き出した画像" style="display:block;max-width:100%;max-height:50vh;margin:8px auto;border:1px solid var(--rule);border-radius:6px">` : ''}
+      <div class="acts"><a class="btn primary" href="${url}" download="${esc(filename)}" target="_blank" rel="noopener">保存：${esc(filename)}</a><button class="btn" id="dlgClose">閉じる</button></div>`, () => { $('dlgClose').onclick = () => { closeDlg(); setTimeout(() => URL.revokeObjectURL(url), 60000); }; });
+    return;
+  }
+  if (!window.claude){ /* opened as a plain file outside the viewer */
+    const blob = data instanceof Blob ? data : new Blob([data]);
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000); return;
+  }
+  toast('この表示では書き出しができません', 'warn');
+}
+async function doExport(kind){
+  closeMenus(); flushBook();
+  const p = page(); if (!p) return;
+  const book = (S.books || []).find(b => b.id === S.bookId);
+  const bt = book ? book.title : '';
+  toast('書き出しを準備中…');
+  try {
+    if (kind === 'jpg'){
+      const c = await pageCanvas(p, bt);
+      const blob = await canvasJpeg(c);
+      await offerFile(`${safeName(bt)}_${S.cur + 1}_${safeName(p.title)}.jpg`, blob);
+    } else {
+      const pages = kind === 'pdfAll' ? S.book.pages : [p];
+      const imgs = [];
+      for (const pg of pages){
+        const c = await pageCanvas(pg, bt);
+        const blob = await canvasJpeg(c);
+        imgs.push({bytes:new Uint8Array(await blob.arrayBuffer()), w:c.width, h:c.height, pw:c.width, ph:c.height});
+      }
+      const pdf = makePdf(imgs);
+      const name = kind === 'pdfAll' ? `${safeName(bt)}.pdf` : `${safeName(bt)}_${S.cur + 1}_${safeName(p.title)}.pdf`;
+      await offerFile(name, new Blob([pdf], {type:'application/pdf'}));
+    }
+  } catch(e){ toast('書き出しに失敗しました', 'warn'); }
+}
+$('exJpg').onclick = () => doExport('jpg');
+$('exPdf1').onclick = () => doExport('pdf1');
+$('exPdfAll').onclick = () => doExport('pdfAll');
+
+/* ---------- start ---------- */
+window.__men = {S, G, slotAt, placeMember, page, commit, makePdf, pageCanvas, colX, rowY, setReadOnly, canWriteShared, geomKind:(p, a) => (geomOf(p, a) || {}).kind};
+setRosterOpen(S.rosterOpen);
+renderAll();
+Store.init();
+})();
+</script>
+</body></html>
