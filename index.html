@@ -265,6 +265,13 @@ body.ro .arrow .hit{cursor:default}
 .empty .card{background:var(--surface);border:1px solid var(--rule);border-radius:14px;padding:22px 24px;max-width:420px;box-shadow:var(--shadow);display:flex;flex-direction:column;gap:12px}
 .empty h3{margin:0;font-size:17px}
 .empty p{margin:0;color:var(--ink-2);line-height:1.7}
+.empty .card.start{max-width:460px;width:calc(100% - 32px);box-sizing:border-box;max-height:calc(100% - 24px);overflow:auto}
+.empty h4{margin:6px 0 0;font-size:14px}
+.empty .blist{display:flex;flex-direction:column;gap:6px}
+.empty .bopen{display:flex;align-items:center;justify-content:space-between;gap:10px;text-align:left;border:1px solid var(--rule);background:var(--paper);color:var(--ink);border-radius:8px;padding:10px 12px;font:inherit;cursor:pointer}
+.empty .bopen:hover{border-color:var(--accent)}
+.empty .bopen .t{font-weight:700;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.empty .bopen .d{color:var(--ink-2);font-size:12px;flex:none}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .row input{flex:1;min-width:0;border:1px solid var(--rule);border-radius:8px;padding:7px 10px;background:var(--paper)}
 /* dialogs */
@@ -823,10 +830,7 @@ function onBooks(list){
   list = list.filter(b => b && SAFE_ID.test(String(b.id))).map(b => ({id:b.id, title:txt(b.title, 80), createdAt:Number(b.createdAt) || 0}));
   S.books = list.slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   if (S.bookId && !S.books.some(b => b.id === S.bookId)){ S.bookId = null; S.book = null; Store.watchBook(null); }
-  if (!S.bookId && S.books.length){
-    const last = LS.get('men.lastBook', null);
-    openBook(S.books.some(b => b.id === last) ? last : S.books[0].id);
-  }
+  /* 開いた直後は，どのブックも開かない（はじめの画面で新しく作るか，作ってあるものを選ぶ） */
   renderTop(); renderEmpty();
   if (S.dlg === 'books') renderBooksDialog();
 }
@@ -1492,9 +1496,10 @@ function booksDialog(){
   openDlg('books', `<h3>ブック（1回の正規練ごと）</h3>
     <div class="row ro-hide"><input id="newBookTitle" placeholder="例：10/3（土）正規練 亥鼻" aria-label="新しいブックの名前"><button class="btn primary" id="newBookBtn">＋ 作成</button></div>
     <div class="books" id="bookList"></div>
-    <div class="acts"><button class="btn" id="dlgClose">閉じる</button></div>`, () => {
+    <div class="acts">${S.bookId ? '<button class="btn" id="closeBook">このブックを閉じてはじめの画面へ</button>' : ''}<button class="btn" id="dlgClose">閉じる</button></div>`, () => {
     renderBooksDialog();
     $('dlgClose').onclick = closeDlg;
+    if ($('closeBook')) $('closeBook').onclick = () => { flushBook(); S.bookId = null; S.book = null; S.loadedBook = null; S.undo = []; S.redo = []; S.sel = null; S.chainSrc = null; Store.watchBook(null); closeDlg(); renderAll(); };
     $('newBookBtn').onclick = () => createBook($('newBookTitle').value);
     $('newBookTitle').addEventListener('keydown', (e) => { if (e.key === 'Enter') createBook(e.target.value); });
     $('bookList').addEventListener('click', async (e) => {
@@ -1650,11 +1655,23 @@ function renderEmpty(){
     el.innerHTML = '<div class="card"><h3>まだブックがありません</h3><p>閲覧のみのため，ここからは作成できません。</p></div>'; return;
   }
   const localNote = S.store === 'local' ? `<p class="note">共有の保存先に接続できていません。保存済みの振り分けを見るには，${login}下の「作成」はこの端末だけで試す場合に使えます。</p>` : '';
-  el.innerHTML = `<div class="card"><h3>最初のブックを作りましょう</h3>${localNote}
-    <p>1回の正規練につき1冊のブックを作り，その中にメニュー（時間帯）ごとのページを並べます。</p>
-    <div class="row"><input id="firstBook" placeholder="例：10/3（土）正規練 亥鼻" aria-label="ブックの名前"><button class="btn primary" id="firstBookBtn">作成</button></div></div>`;
-  $('firstBookBtn').onclick = () => createBook($('firstBook').value);
-  $('firstBook').addEventListener('keydown', (e) => { if (e.key === 'Enter') createBook(e.target.value); });
+  const books = S.books || [];
+  const now = new Date();
+  const today = `${now.getMonth() + 1}/${now.getDate()}（${'日月火水木金土'[now.getDay()]}）`;
+  const list = books.length ? `<h4>作ってあるブックを開く</h4><div class="blist">${books.slice(0, 8).map(b => `<button class="bopen" data-open="${esc(b.id)}"><span class="t">${esc(b.title || '（無題）')}</span><span class="d">${fmtDate(b.createdAt)}</span></button>`).join('')}</div>${books.length > 8 ? '<button class="btn ghost" id="allBooks">すべてのブックを見る</button>' : ''}` : '';
+  el.innerHTML = S.readOnly
+    ? `<div class="card start"><h3>面の振り分け</h3>${list || '<p>まだブックがありません。閲覧のみのため，ここからは作成できません。</p>'}</div>`
+    : `<div class="card start"><h3>新しい振り分けを始める</h3>${localNote}
+      <p>1回の正規練につき1冊のブックを作り，その中にメニュー（時間帯）ごとのページを並べます。</p>
+      <div class="row"><input id="firstBook" value="${esc(today)}" placeholder="例：10/3（土）正規練 亥鼻" aria-label="新しいブックの名前"><button class="btn primary" id="firstBookBtn">作成</button></div>
+      ${list}</div>`;
+  const fb = $('firstBook');
+  if (fb){
+    $('firstBookBtn').onclick = () => createBook(fb.value);
+    fb.addEventListener('keydown', (e) => { if (e.key === 'Enter') createBook(e.target.value); });
+  }
+  el.querySelectorAll('[data-open]').forEach(b => b.onclick = () => openBook(b.dataset.open));
+  const ab = $('allBooks'); if (ab) ab.onclick = () => booksDialog();
 }
 function renderAll(){ renderTop(); renderEmpty(); renderCourt(); renderRoster(); setHint(); }
 function goPage(i){ if (!S.book) return; flushTitle(); S.cur = Math.max(0, Math.min(S.book.pages.length - 1, i)); S.sel = null; S.chainSrc = null; hidePop(); renderAll(); }
